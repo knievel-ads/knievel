@@ -71,7 +71,18 @@ pub async fn run(args: SeedDemoArgs) -> Result<SeedDemoOutput> {
     let (org_id, _) = upsert_org(&pool, &args.org_external_id, "Demo Org").await?;
     let (project_id, project_was_new) =
         upsert_project(&pool, &org_id, &args.project_external_id).await?;
-    if project_was_new {
+    // Seed taxonomy when the project is new OR when an earlier
+    // interrupted run left it without taxonomy. `upsert_project` commits
+    // the project row in its own transaction, separate from this one, so
+    // a crash between the two — e.g. racing the server's `auto_migrate`
+    // on a fresh DB, where `seed_default_taxonomy` hits "relation
+    // knievel.channels does not exist" after the project row is already
+    // committed — orphans a project with no taxonomy. The bare
+    // `project_was_new` guard would then skip re-seeding on every retry
+    // and `lookup_default_taxonomy` fails forever (knievel-ads/knievel#31).
+    // `seed_default_taxonomy` commits all-or-nothing, so "absent" never
+    // means "partial" — re-seeding is safe and self-healing.
+    if project_was_new || !taxonomy_seeded(&pool, &org_id, &project_id).await? {
         let mut tx = db::begin_bound(&pool, &org_id, Some(&project_id)).await?;
         taxonomy::seed_default_taxonomy(&mut tx, &org_id, &project_id)
             .await
@@ -247,6 +258,23 @@ async fn lookup_default_taxonomy(
     .context("lookup Medium Rectangle ad type")?;
     tx.commit().await?;
     Ok((priority_id, ad_type_id))
+}
+
+/// True when default taxonomy has been seeded for `project_id`. Lets
+/// `run` re-seed a project orphaned by an interrupted earlier run
+/// (project row committed, taxonomy tx not) instead of skipping forever
+/// on the `project_was_new` guard. See knievel-ads/knievel#31.
+async fn taxonomy_seeded(pool: &PgPool, org_id: &str, project_id: &str) -> Result<bool> {
+    let mut tx = db::begin_bound(pool, org_id, Some(project_id)).await?;
+    let seeded: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM knievel.priorities WHERE project_id = $1)",
+    )
+    .bind(project_id)
+    .fetch_one(&mut *tx)
+    .await
+    .context("check taxonomy seeded")?;
+    tx.commit().await?;
+    Ok(seeded)
 }
 
 async fn upsert_advertiser(pool: &PgPool, org_id: &str, project_id: &str) -> Result<i64> {

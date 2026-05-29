@@ -1323,6 +1323,28 @@ manager and leader election running.
       set; they earn their keep when a second consumer (Python
       / Go binding, doc-site renderer) shows up.
 
+- [x] **3.34** `claim_mapping` rule evaluation — closes the
+      deferred piece (3) of 3.26 and the JWT side of 3.27.
+      `JwtIssuerConfig` grows a `claim_mapping` block
+      (`rules[].{match, principal}`); both `validate` (sync) and
+      `JwtVerifier::verify` (runtime) fall back to it when the
+      token carries no `claim` — e.g. Kubernetes ServiceAccount
+      tokens, whose identity is in `sub` and which have no
+      `knievel` claim. First matching rule wins; no match →
+      `ClaimMissing` (same 401 as a token with no usable claim);
+      a verbatim `knievel` claim still takes precedence over the
+      mapping. `system::build_auth_block` now reads the real
+      verifier policies — `auth.modes` gains `"jwt"` when issuers
+      are configured, and each issuer's `claim_source` reports
+      `claim_mapping(<n>)` vs the verbatim claim name. Chart
+      `configmap.yaml` renders `claim_mapping` per issuer via a
+      `toYaml` pass-through. Three unit tests: SA-token → principal
+      via `sub`, no-match → `ClaimMissing`, and
+      verbatim-claim-beats-mapping precedence.
+      Refs: `AUTH.md` "Kubernetes ServiceAccount Tokens,"
+      "Effective-policy visibility"; `MIGRATION_RX.md`
+      "Authentication."
+
 **Milestone:** Every endpoint in `API.md` returns the documented
 shape. Full API-contract suite + cross-tenant suite green for every
 project-scoped endpoint.

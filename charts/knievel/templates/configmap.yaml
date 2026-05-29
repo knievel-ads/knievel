@@ -92,5 +92,9 @@ data:
             {{- with .claim }}
             claim: {{ . | quote }}
             {{- end }}
+            {{- with .claimMapping }}
+            claim_mapping:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
           {{- end }}
     {{- end }}

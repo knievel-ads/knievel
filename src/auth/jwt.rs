@@ -38,7 +38,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 
 use crate::auth::{Principal, Role, Scope};
-use crate::config::JwtIssuerConfig;
+use crate::config::{ClaimMappingConfig, ClaimMappingRule, JwtIssuerConfig};
 
 /// Errors raised by `validate`. Maps directly to the `code` /
 /// `detail` field surfaced on `401 invalid_token` per
@@ -79,17 +79,11 @@ pub struct IssuerPolicy {
     pub jwks_url: Option<String>,
     /// Where the authz claim lives. Default: `knievel`.
     pub claim: String,
-    /// Optional rule-driven mapping of standard claims onto
-    /// the authz fields when the issuer can't carry a custom
-    /// claim. v0 stub field — wired in 3.26 follow-up.
-    pub claim_mapping: Vec<ClaimMappingRule>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ClaimMappingRule {
-    pub from: String,
-    pub to: String,
-    pub regex: Option<String>,
+    /// Per-issuer claim mapping. Consulted only when the token lacks
+    /// `claim` (e.g. Kubernetes ServiceAccount tokens, which carry no
+    /// `knievel` claim) — derives the principal from standard claims
+    /// such as `sub`. Empty for the common Keycloak case.
+    pub claim_mapping: ClaimMappingConfig,
 }
 
 /// Default algorithm allow-list. RSA + ECDSA + RSA-PSS only.
@@ -260,33 +254,24 @@ pub fn validate(
         }
     }
 
-    // Pull the authz claim by name. v0 supports the standard
-    // `knievel` claim only; claim_mapping rules land in the
-    // follow-up.
+    // Authz claim: prefer the verbatim `knievel` claim; fall back to
+    // claim_mapping rules when the token lacks it (e.g. Kubernetes SA
+    // tokens, which carry no `knievel` claim).
     let payload: serde_json::Value =
         serde_json::from_slice(&payload_bytes).map_err(|_| JwtError::Malformed)?;
-    let raw_claim = payload
-        .get(&policy.claim)
-        .ok_or(JwtError::ClaimMissing)?
-        .clone();
-    let claim: KnievelClaim =
-        serde_json::from_value(raw_claim).map_err(|_| JwtError::ClaimMalformed)?;
-
-    let scope = match claim.scope.as_str() {
-        "org" => Scope::Org,
-        "project" => Scope::Project,
-        _ => return Err(JwtError::ClaimMalformed),
-    };
-    let role: Role = claim.role.parse().map_err(|_| JwtError::ClaimMalformed)?;
-
-    Ok(Principal {
-        actor_id: format!("jwt:{}", standard.sub.unwrap_or_default()),
-        org_id: claim.org_id,
-        project_id: claim.project_id,
-        scope,
-        role,
-        token_type: crate::auth::TokenType::Jwt,
-    })
+    match payload.get(&policy.claim) {
+        Some(raw_claim) => {
+            let claim: KnievelClaim =
+                serde_json::from_value(raw_claim.clone()).map_err(|_| JwtError::ClaimMalformed)?;
+            principal_from_knievel_claim(claim, standard.sub.as_deref())
+        }
+        None if !policy.claim_mapping.rules.is_empty() => principal_from_claim_mapping(
+            &payload,
+            &policy.claim_mapping.rules,
+            standard.sub.as_deref(),
+        ),
+        None => Err(JwtError::ClaimMissing),
+    }
 }
 
 fn audience_contains(aud: &serde_json::Value, want: &str) -> bool {
@@ -304,6 +289,67 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Convert a parsed `knievel` claim into a `Principal`. Shared by the
+/// sync `validate` path and the async `JwtVerifier::verify` path so the
+/// scope/role parsing stays in one place.
+fn principal_from_knievel_claim(
+    claim: KnievelClaim,
+    sub: Option<&str>,
+) -> Result<Principal, JwtError> {
+    let scope = match claim.scope.as_str() {
+        "org" => Scope::Org,
+        "project" => Scope::Project,
+        _ => return Err(JwtError::ClaimMalformed),
+    };
+    let role: Role = claim.role.parse().map_err(|_| JwtError::ClaimMalformed)?;
+    Ok(Principal {
+        actor_id: format!("jwt:{}", sub.unwrap_or_default()),
+        org_id: claim.org_id,
+        project_id: claim.project_id,
+        scope,
+        role,
+        token_type: crate::auth::TokenType::Jwt,
+    })
+}
+
+/// Synthesize a `Principal` from the first claim-mapping rule whose
+/// `match` entries all equal the corresponding top-level string claims
+/// in `claims` (`AUTH.md` "Kubernetes ServiceAccount Tokens": first
+/// matching rule wins). Returns `ClaimMissing` when no rule matches, so
+/// the caller surfaces the same 401 as a token carrying no usable claim.
+fn principal_from_claim_mapping(
+    claims: &serde_json::Value,
+    rules: &[ClaimMappingRule],
+    sub: Option<&str>,
+) -> Result<Principal, JwtError> {
+    let rule = rules
+        .iter()
+        .find(|r| {
+            r.match_claims
+                .iter()
+                .all(|(k, v)| claims.get(k).and_then(|c| c.as_str()) == Some(v.as_str()))
+        })
+        .ok_or(JwtError::ClaimMissing)?;
+    let scope = match rule.principal.scope.as_str() {
+        "org" => Scope::Org,
+        "project" => Scope::Project,
+        _ => return Err(JwtError::ClaimMalformed),
+    };
+    let role: Role = rule
+        .principal
+        .role
+        .parse()
+        .map_err(|_| JwtError::ClaimMalformed)?;
+    Ok(Principal {
+        actor_id: format!("jwt:{}", sub.unwrap_or_default()),
+        org_id: rule.principal.org_id.clone(),
+        project_id: rule.principal.project_id.clone(),
+        scope,
+        role,
+        token_type: crate::auth::TokenType::Jwt,
+    })
 }
 
 /// Runtime JWT verifier. Owns the configured issuer policies, the
@@ -449,28 +495,21 @@ impl JwtVerifier {
                 }
             })?;
 
-        let raw_claim = token_data
-            .claims
-            .get(&policy.claim)
-            .ok_or(JwtError::ClaimMissing)?
-            .clone();
-        let claim: KnievelClaim =
-            serde_json::from_value(raw_claim).map_err(|_| JwtError::ClaimMalformed)?;
-        let scope = match claim.scope.as_str() {
-            "org" => Scope::Org,
-            "project" => Scope::Project,
-            _ => return Err(JwtError::ClaimMalformed),
-        };
-        let role: Role = claim.role.parse().map_err(|_| JwtError::ClaimMalformed)?;
-
-        Ok(Principal {
-            actor_id: format!("jwt:{}", standard.sub.unwrap_or_default()),
-            org_id: claim.org_id,
-            project_id: claim.project_id,
-            scope,
-            role,
-            token_type: crate::auth::TokenType::Jwt,
-        })
+        // Authz claim: prefer the verbatim `knievel` claim; fall back
+        // to claim_mapping rules when the token lacks it (k8s SA tokens).
+        match token_data.claims.get(&policy.claim) {
+            Some(raw_claim) => {
+                let claim: KnievelClaim = serde_json::from_value(raw_claim.clone())
+                    .map_err(|_| JwtError::ClaimMalformed)?;
+                principal_from_knievel_claim(claim, standard.sub.as_deref())
+            }
+            None if !policy.claim_mapping.rules.is_empty() => principal_from_claim_mapping(
+                &token_data.claims,
+                &policy.claim_mapping.rules,
+                standard.sub.as_deref(),
+            ),
+            None => Err(JwtError::ClaimMissing),
+        }
     }
 
     async fn lookup_jwk(
@@ -572,7 +611,36 @@ mod tests {
             algorithms: default_algorithms(),
             jwks_url: None,
             claim: "knievel".into(),
-            claim_mapping: vec![],
+            claim_mapping: ClaimMappingConfig::default(),
+        }
+    }
+
+    /// Issuer modeling a Kubernetes API server: tokens carry no
+    /// `knievel` claim, so the principal is derived from `sub` via
+    /// claim_mapping (`AUTH.md` "Kubernetes ServiceAccount Tokens").
+    fn policy_with_sa_mapping() -> IssuerPolicy {
+        let mut match_claims = std::collections::BTreeMap::new();
+        match_claims.insert(
+            "sub".to_string(),
+            "system:serviceaccount:rx-prod:rx-rails".to_string(),
+        );
+        IssuerPolicy {
+            issuer: "https://kubernetes.default.svc.cluster.local".into(),
+            audience: "knievel".into(),
+            algorithms: default_algorithms(),
+            jwks_url: None,
+            claim: "knievel".into(),
+            claim_mapping: ClaimMappingConfig {
+                rules: vec![ClaimMappingRule {
+                    match_claims,
+                    principal: crate::config::ClaimPrincipal {
+                        scope: "org".into(),
+                        org_id: "scientist-com-prod".into(),
+                        project_id: None,
+                        role: "editor".into(),
+                    },
+                }],
+            },
         }
     }
 
@@ -725,6 +793,62 @@ mod tests {
         assert_eq!(p.org_id, "o");
         assert_eq!(p.project_id.as_deref(), Some("pj_1"));
         assert_eq!(p.scope, Scope::Project);
+        assert_eq!(p.role, Role::Admin);
+    }
+
+    #[test]
+    fn claim_mapping_synthesizes_principal_from_sub() {
+        // A k8s ServiceAccount token: no `knievel` claim, identity in `sub`.
+        let t = make_token(
+            serde_json::json!({"alg": "RS256", "kid": "k1"}),
+            serde_json::json!({
+                "iss": "https://kubernetes.default.svc.cluster.local",
+                "aud": "knievel",
+                "sub": "system:serviceaccount:rx-prod:rx-rails"
+            }),
+        );
+        let p = validate(&t, &[policy_with_sa_mapping()], 0).unwrap();
+        assert_eq!(p.org_id, "scientist-com-prod");
+        assert_eq!(p.scope, Scope::Org);
+        assert_eq!(p.role, Role::Editor);
+        assert_eq!(p.project_id, None);
+        assert_eq!(p.actor_id, "jwt:system:serviceaccount:rx-prod:rx-rails");
+    }
+
+    #[test]
+    fn claim_mapping_no_matching_rule_is_claim_missing() {
+        // sub doesn't match any rule → same 401 as a token with no claim.
+        let t = make_token(
+            serde_json::json!({"alg": "RS256", "kid": "k1"}),
+            serde_json::json!({
+                "iss": "https://kubernetes.default.svc.cluster.local",
+                "aud": "knievel",
+                "sub": "system:serviceaccount:other-ns:stranger"
+            }),
+        );
+        assert!(matches!(
+            validate(&t, &[policy_with_sa_mapping()], 0),
+            Err(JwtError::ClaimMissing)
+        ));
+    }
+
+    #[test]
+    fn verbatim_knievel_claim_takes_precedence_over_mapping() {
+        // When both a `knievel` claim AND mapping rules exist, the
+        // claim wins (mapping is a fallback for issuers that can't
+        // carry it).
+        let t = make_token(
+            serde_json::json!({"alg": "RS256", "kid": "k1"}),
+            serde_json::json!({
+                "iss": "https://kubernetes.default.svc.cluster.local",
+                "aud": "knievel",
+                "sub": "system:serviceaccount:rx-prod:rx-rails",
+                "knievel": {"scope": "project", "org_id": "o", "project_id": "pj_9", "role": "admin"}
+            }),
+        );
+        let p = validate(&t, &[policy_with_sa_mapping()], 0).unwrap();
+        assert_eq!(p.org_id, "o");
+        assert_eq!(p.project_id.as_deref(), Some("pj_9"));
         assert_eq!(p.role, Role::Admin);
     }
 

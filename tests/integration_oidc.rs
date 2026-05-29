@@ -329,6 +329,7 @@ fn build_app_with_issuer(issuer: &str) -> impl poem::Endpoint {
         // (`{issuer}/.well-known/openid-configuration`).
         jwks_url: String::new(),
         claim: "knievel".into(),
+        claim_mapping: Default::default(),
     };
     let verifier = knievel::auth::jwt::JwtVerifier::new(vec![issuer_cfg]);
     let state = knievel::state::AppState::new().with_jwt_verifier(verifier);

@@ -116,22 +116,42 @@ impl SystemApi {
     }
 }
 
-/// Materialize the `/version` auth block from `AppState`. Phase
-/// 3.27 v0: opaque tokens are always available (the `api_tokens`
-/// table is in every deployment); JWT mode is enabled when the
-/// config carries one or more issuer policies. Empty
-/// `auth.issuers` here means "no JWT issuers configured" —
-/// pure-opaque deployments serve a legitimate empty array.
-fn build_auth_block(_state: &AppState) -> AuthBlock {
-    let mut block = AuthBlock {
-        modes: vec!["opaque".into()],
-        issuers: vec![],
-    };
-    // JWT mode + per-issuer policies are wired in once `Config`
-    // grows the `auth.jwt.issuers` block (3.27 follow-up). For
-    // now the binary advertises only the always-on opaque mode.
-    let _ = &mut block.issuers;
-    block
+/// Materialize the `/version` auth block from `AppState`. Opaque
+/// tokens are always available (the `api_tokens` table is in every
+/// deployment); JWT mode is advertised when the config carries one or
+/// more issuer policies. Empty `auth.issuers` means "no JWT issuers
+/// configured" — pure-opaque deployments serve a legitimate empty array.
+fn build_auth_block(state: &AppState) -> AuthBlock {
+    let policies = state.jwt_verifier.policies();
+    let mut modes = vec!["opaque".to_string()];
+    if !policies.is_empty() {
+        modes.push("jwt".to_string());
+    }
+    let issuers = policies
+        .iter()
+        .map(|p| {
+            // `claim_mapping(<n>)` when the issuer derives the principal
+            // from standard claims (e.g. k8s SA tokens); otherwise the
+            // verbatim claim name (default `knievel`).
+            let claim_source = if p.claim_mapping.rules.is_empty() {
+                p.claim.clone()
+            } else {
+                format!("claim_mapping({})", p.claim_mapping.rules.len())
+            };
+            IssuerSummary {
+                issuer: p.issuer.clone(),
+                audience: p.audience.clone(),
+                algorithms: p.algorithms.clone(),
+                claim_source,
+                jwks_url: if p.jwks_url.is_empty() {
+                    None
+                } else {
+                    Some(p.jwks_url.clone())
+                },
+            }
+        })
+        .collect();
+    AuthBlock { modes, issuers }
 }
 
 #[cfg(test)]

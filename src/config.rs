@@ -93,6 +93,13 @@ pub struct JwtIssuerConfig {
     /// Defaults to `knievel`.
     #[serde(default = "default_jwt_claim")]
     pub claim: String,
+    /// Optional per-issuer claim mapping. When the IdP can't carry a
+    /// custom `knievel` claim (e.g. Kubernetes ServiceAccount tokens),
+    /// these rules derive the principal from standard claims (typically
+    /// `sub`). First matching rule wins; only consulted when the token
+    /// lacks `claim`. See `AUTH.md` "Kubernetes ServiceAccount Tokens".
+    #[serde(default)]
+    pub claim_mapping: ClaimMappingConfig,
 }
 
 fn default_jwt_algorithms() -> Vec<String> {
@@ -101,6 +108,38 @@ fn default_jwt_algorithms() -> Vec<String> {
 
 fn default_jwt_claim() -> String {
     "knievel".into()
+}
+
+/// Per-issuer claim-mapping config: an ordered rule list. Empty by
+/// default — most issuers carry a verbatim `knievel` claim and never
+/// reach the mapping path.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct ClaimMappingConfig {
+    #[serde(default)]
+    pub rules: Vec<ClaimMappingRule>,
+}
+
+/// One claim-mapping rule. When every entry in `match` equals the
+/// corresponding top-level string claim in the token, the principal is
+/// synthesized from `principal`. `match` keys are claim names (typically
+/// `sub`, e.g. `system:serviceaccount:rx-prod:rx-rails`).
+#[derive(Deserialize, Debug, Clone)]
+pub struct ClaimMappingRule {
+    #[serde(rename = "match")]
+    pub match_claims: std::collections::BTreeMap<String, String>,
+    pub principal: ClaimPrincipal,
+}
+
+/// The authz principal a matched claim-mapping rule produces. Mirrors
+/// the `knievel` claim shape (`scope`, `org_id`, optional `project_id`,
+/// `role`).
+#[derive(Deserialize, Debug, Clone)]
+pub struct ClaimPrincipal {
+    pub scope: String,
+    pub org_id: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    pub role: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]

@@ -153,3 +153,66 @@ async fn seed_demo_seeds_a_decision_ready_project() -> Result<()> {
     testlib::db::ephemeral_drop(db).await?;
     Ok(())
 }
+
+/// Regression for knievel-ads/knievel#31: a project created by an
+/// earlier interrupted run (project row committed, taxonomy tx not)
+/// must be re-seeded, not skipped forever on the `project_was_new`
+/// guard. We simulate the orphan by inserting a bare project row with no
+/// taxonomy, then assert seed-demo re-seeds it and runs to completion
+/// (pre-fix this errored with "lookup Standard priority: no rows").
+#[tokio::test]
+async fn seed_demo_reseeds_orphaned_project() -> Result<()> {
+    if std::env::var("DATABASE_URL").is_err() {
+        eprintln!("DATABASE_URL not set; skipping.");
+        return Ok(());
+    }
+
+    let db = testlib::db::ephemeral().await?;
+
+    // First run establishes the org (its demo-project is irrelevant here).
+    let base = run(SeedDemoArgs {
+        database_url: db.url.clone(),
+        org_external_id: "demo-org".into(),
+        project_external_id: "demo-project".into(),
+        token: None,
+        write_token_to: None,
+    })
+    .await?;
+
+    // Simulate the orphan: a bare project row with no taxonomy, as an
+    // interrupted run would leave (project committed before the taxonomy
+    // tx). Inserted directly, bound to the org.
+    {
+        let mut tx = testlib::tenant::begin_bound(&db.pool, &base.org_id, None).await?;
+        sqlx::query(
+            "INSERT INTO knievel.projects (id, org_id, external_id, name)
+             VALUES ('pj_orphan_regress', $1, 'orphan-project', 'Orphan')",
+        )
+        .bind(&base.org_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
+
+    // Pre-fix: project_was_new == false -> taxonomy seeding skipped ->
+    // lookup_default_taxonomy errors. Post-fix: taxonomy_seeded() == false
+    // -> re-seed -> run completes.
+    let out = run(SeedDemoArgs {
+        database_url: db.url.clone(),
+        org_external_id: "demo-org".into(),
+        project_external_id: "orphan-project".into(),
+        token: None,
+        write_token_to: None,
+    })
+    .await?;
+
+    assert_eq!(out.project_id, "pj_orphan_regress");
+    assert!(out.priority_id > 0, "taxonomy was re-seeded for the orphan");
+    assert!(
+        out.flight_id > 0 && out.ad_id > 0,
+        "demo chain completed after re-seed"
+    );
+
+    testlib::db::ephemeral_drop(db).await?;
+    Ok(())
+}

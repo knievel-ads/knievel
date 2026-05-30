@@ -4032,6 +4032,21 @@ components:
           type: string
         impression_url:
           type: string
+        creative:
+          description: |-
+            The selected ad's creative, typed by `kind` (`API.md` § 1
+            `oneOf`). `null` when the ad has no creative attached or the
+            snapshot hasn't loaded it yet. For `templated` creatives the
+            `body` is rendered server-side at decision time; the other
+            kinds carry their stored fields verbatim.
+          allOf:
+          - $ref: '#/components/schemas/DecisionCreative'
+          - description: |-
+              The selected ad's creative, typed by `kind` (`API.md` § 1
+              `oneOf`). `null` when the ad has no creative attached or the
+              snapshot hasn't loaded it yet. For `templated` creatives the
+              `body` is rendered server-side at decision time; the other
+              kinds carry their stored fields verbatim.
     DecisionBlock:
       type: object
       title: DecisionBlock
@@ -4061,6 +4076,88 @@ components:
           type: string
         user_agent:
           type: string
+    DecisionCreative:
+      type: object
+      description: |-
+        The decision response's typed creative block — a discriminated
+        union on `type` mirroring `API.md` § 1 / § 3.5. The four arms
+        match the four creative `kind`s.
+      anyOf:
+      - $ref: '#/components/schemas/DecisionCreative_ImageCreative'
+      - $ref: '#/components/schemas/DecisionCreative_HtmlCreative'
+      - $ref: '#/components/schemas/DecisionCreative_NativeCreative'
+      - $ref: '#/components/schemas/DecisionCreative_TemplatedCreative'
+      discriminator:
+        propertyName: type
+        mapping:
+          image: '#/components/schemas/DecisionCreative_ImageCreative'
+          html: '#/components/schemas/DecisionCreative_HtmlCreative'
+          native: '#/components/schemas/DecisionCreative_NativeCreative'
+          templated: '#/components/schemas/DecisionCreative_TemplatedCreative'
+    DecisionCreative_HtmlCreative:
+      description: |-
+        The decision response's typed creative block — a discriminated
+        union on `type` mirroring `API.md` § 1 / § 3.5. The four arms
+        match the four creative `kind`s.
+      allOf:
+      - type: object
+        required:
+        - type
+        properties:
+          type:
+            type: string
+            enum:
+            - html
+            example: html
+      - $ref: '#/components/schemas/HtmlCreative'
+    DecisionCreative_ImageCreative:
+      description: |-
+        The decision response's typed creative block — a discriminated
+        union on `type` mirroring `API.md` § 1 / § 3.5. The four arms
+        match the four creative `kind`s.
+      allOf:
+      - type: object
+        required:
+        - type
+        properties:
+          type:
+            type: string
+            enum:
+            - image
+            example: image
+      - $ref: '#/components/schemas/ImageCreative'
+    DecisionCreative_NativeCreative:
+      description: |-
+        The decision response's typed creative block — a discriminated
+        union on `type` mirroring `API.md` § 1 / § 3.5. The four arms
+        match the four creative `kind`s.
+      allOf:
+      - type: object
+        required:
+        - type
+        properties:
+          type:
+            type: string
+            enum:
+            - native
+            example: native
+      - $ref: '#/components/schemas/NativeCreative'
+    DecisionCreative_TemplatedCreative:
+      description: |-
+        The decision response's typed creative block — a discriminated
+        union on `type` mirroring `API.md` § 1 / § 3.5. The four arms
+        match the four creative `kind`s.
+      allOf:
+      - type: object
+        required:
+        - type
+        properties:
+          type:
+            type: string
+            enum:
+            - templated
+            example: templated
+      - $ref: '#/components/schemas/TemplatedCreative'
     DecisionPlacement:
       type: object
       title: DecisionPlacement
@@ -4314,6 +4411,31 @@ components:
         creative_id:
           type: integer
           format: int64
+    HtmlCreative:
+      type: object
+      title: HtmlCreative
+      properties:
+        body:
+          type: string
+          description: Verbatim HTML stored on the creative, returned as-is.
+        click_through_url:
+          type: string
+    ImageCreative:
+      type: object
+      title: ImageCreative
+      properties:
+        image_url:
+          type: string
+        width:
+          type: integer
+          format: int32
+        height:
+          type: integer
+          format: int32
+        alt:
+          type: string
+        click_through_url:
+          type: string
     IssuerSummary:
       type: object
       title: IssuerSummary
@@ -4339,6 +4461,20 @@ components:
             mapping rules pull standard-claim values into the authz
             shape.
         jwks_url:
+          type: string
+    NativeCreative:
+      type: object
+      title: NativeCreative
+      required:
+      - values
+      properties:
+        template:
+          type: string
+          description: |-
+            The referenced template's name; the caller renders `values`
+            client-side using its own components.
+        values: {}
+        click_through_url:
           type: string
     OrgResponse:
       type: object
@@ -4494,6 +4630,26 @@ components:
           items:
             $ref: '#/components/schemas/Site'
         next_cursor:
+          type: string
+    TemplatedCreative:
+      type: object
+      title: TemplatedCreative
+      required:
+      - values
+      - body
+      properties:
+        template:
+          type: string
+          description: The referenced template's name.
+        values:
+          description: Echoed so callers can re-render or inspect.
+        body:
+          type: string
+          description: |-
+            The template's Liquid source rendered against `values` plus
+            the injected decision context (signed URLs, placement id,
+            snapshot version) at decision time.
+        click_through_url:
           type: string
     TokenListResponse:
       type: object

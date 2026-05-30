@@ -2396,6 +2396,82 @@ re-prioritize within the phase.
       knievel_loader` (plus the loader role's INSERT/UPDATE grants on
       the rollup tables) is a small follow-up bundled with 6.8.
 
+- [x] **6.8** Decision-time creative rendering + the typed
+      `creative` response block. The snapshot now carries a
+      per-project `creatives` map (`SnapshotCreative`, joined to
+      `creative_templates` for the template name + Liquid source);
+      `decide_pure` looks up the selected ad's creative and emits the
+      `API.md` § 1 `oneOf` (`image`/`html`/`native`/`templated`) on
+      `DecisionAd.creative`. `templated` creatives are rendered
+      server-side via `rendering::render_templated` against the
+      freshly-signed click/impression URLs; a render failure no-fills
+      that one ad (skip push + skip event, warn) rather than failing
+      the request. The long-hardcoded `creative_id: 0` is replaced
+      with `ad.creative_id.unwrap_or(0)` everywhere it appeared
+      (signature payload, `DecisionAd`, the explainer, and the
+      Decision event row — the last unblocks creative-grained
+      rollup). Bundles the **C2b rollup fix** (see note). New
+      integration tests cover templated render over real HTTP +
+      cross-tenant render isolation, and cross-tenant rollup
+      aggregation.
+      Refs: `API.md` § 1, § 3.5, § 3.6; `REQUIREMENTS.md` § 6.1,
+      § 7.3; `MIGRATION_RX.md`.
+
+      **Note (6.8):** What landed:
+
+      - **Wire `creative.template` is the template *name*** (`creative_templates.name`,
+        e.g. `sponsored_card_v1`), matching the `API.md` § 1
+        example — not the external_id. `native`/`templated` carry it;
+        image/html leave it null.
+      - **`Union` (poem-openapi) emits `anyOf` + a `type`
+        discriminator**, not literal `oneOf` (library convention,
+        same as every other union in the spec). The gem's oneOf
+        generator may need the post-processing already flagged for
+        C3; the binary's spec is the contract and the drift gate is
+        green.
+      - **C2b rollup RLS fix.** `rollup::run_once` now wraps every
+        read/write in a per-hour `SET LOCAL ROLE knievel_loader`
+        transaction. This was load-bearing: `events_raw` is org-RLS,
+        `events_rollup` is project-RLS, and `events_rollup_watermark`
+        has *no* write policy — so the old raw-pool path silently read
+        zero rows and never advanced the watermark. The loader role
+        gained `INSERT, UPDATE ON events_rollup` + `UPDATE ON
+        events_rollup_watermark` (testlib `db.rs`, compose
+        `init.sql`, `MIGRATION_RX.md`). The pre-migration `ci.yml`
+        psql steps only *create* the role; per-table grants live in
+        `db.rs` because the tables don't exist when those steps run.
+      - **First-run watermark clamp.** Fixing the RLS bug *activates*
+        the catch-up loop, which on a fresh DB (watermark at epoch 0)
+        would otherwise grind ~55 years of empty hours one tx at a
+        time. `run_once` now jumps a cold/stale watermark to the
+        earliest `events_raw` hour (or to `target` when empty) before
+        looping. Bounded by raw retention; skipped entirely in steady
+        state.
+      - **NULL-dim coalesce.** The aggregate COALESCEs every nullable
+        dimension to the `0` sentinel before the `events_rollup`
+        insert. Without it, live impression/click events (NULL
+        site/zone/flight — see `event_endpoints::emit_event`) and
+        zone-/creative-less decisions would violate the table's
+        NOT-NULL primary key, abort the hour's tx, and — because the
+        watermark never advances — re-poison every subsequent tick,
+        wedging the whole rollup. **Found by the adversarial review:**
+        the RLS fix *activates* the loop, so this had to land in the
+        same change, not defer to Phase 5. `0` is the same
+        "unattributed" sentinel the decision path uses for
+        `creative_id`; real ids are bigserial (≥ 1) so there's no
+        collision. (Phase 5's sentinel/orphan policy is a *separate*
+        concern — backfill attribution of historical Kevel ids with
+        no knievel entity, not live NULL dims.)
+
+      What's deferred:
+
+      - **Configurable render caps + `/version` surface.** The
+        output-byte cap is enforced as a const in `rendering.rs`
+        (already tested); wiring a `DecisionsConfig` override and a
+        render-time-ms cap through to `/version` is the remaining
+        optional piece of the 4.8 risk list. Deferred — the const cap
+        already bounds runaway output.
+
 **Milestone:** `:batchUpsert` is consistent across every
 resource that declares it; POST creates are truly idempotent;
 handler bodies are short again. Every list endpoint in

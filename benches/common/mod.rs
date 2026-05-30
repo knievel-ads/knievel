@@ -117,6 +117,7 @@ pub fn synthesize_snapshot(shape: SnapshotShape) -> ProjectSnapshot {
         }],
         zones: vec![],
         click_through_urls: HashMap::new(),
+        creatives: HashMap::new(),
         hmac_secret: HMAC_SECRET.to_vec(),
         hmac_secret_previous: None,
         allow_force_decision: true,

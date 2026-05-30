@@ -45,7 +45,11 @@ pub fn parser() -> liquid::Parser {
 /// Render a `templated` creative's Liquid `source` against `values` plus
 /// the injected decision context. Returns the rendered HTML, or an error
 /// on parse/render failure or output exceeding [`MAX_OUTPUT_BYTES`].
-pub fn render_templated(source: &str, values: &serde_json::Value, ctx: RenderCtx<'_>) -> Result<String> {
+pub fn render_templated(
+    source: &str,
+    values: &serde_json::Value,
+    ctx: RenderCtx<'_>,
+) -> Result<String> {
     let globals = liquid::to_object(&serde_json::json!({
         "values": values,
         "ad": {
@@ -59,7 +63,9 @@ pub fn render_templated(source: &str, values: &serde_json::Value, ctx: RenderCtx
     .context("building liquid globals")?;
 
     let template = parser().parse(source).context("parsing liquid template")?;
-    let out = template.render(&globals).context("rendering liquid template")?;
+    let out = template
+        .render(&globals)
+        .context("rendering liquid template")?;
 
     if out.len() > MAX_OUTPUT_BYTES {
         anyhow::bail!(

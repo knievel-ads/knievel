@@ -224,12 +224,20 @@ pub async fn ephemeral() -> Result<EphemeralDb> {
     // table privileges. Guarded on the role existing — it's provisioned
     // out-of-band (the superuser branch above, ci.yml, or compose init);
     // if absent, only loader-dependent tests fail, not the whole DB suite.
+    // The snapshot loader only ever SELECTs, but the hourly rollup
+    // (also a `SET LOCAL ROLE knievel_loader` path) writes the two
+    // rollup tables: it INSERT/UPDATEs `events_rollup` (ON CONFLICT
+    // DO UPDATE needs both) and UPDATEs the watermark row. BYPASSRLS
+    // exempts the loader from RLS but not from table privileges, so
+    // those writes need explicit grants here.
     sqlx::query(
         "DO $$ BEGIN \
            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'knievel_loader') THEN \
              GRANT USAGE ON SCHEMA knievel TO knievel_loader; \
              GRANT SELECT ON ALL TABLES IN SCHEMA knievel TO knievel_loader; \
              GRANT SELECT ON ALL SEQUENCES IN SCHEMA knievel TO knievel_loader; \
+             GRANT INSERT, UPDATE ON knievel.events_rollup TO knievel_loader; \
+             GRANT UPDATE ON knievel.events_rollup_watermark TO knievel_loader; \
            END IF; \
          END $$",
     )

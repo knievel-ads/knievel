@@ -138,6 +138,7 @@ impl CloneBox for knievel::snapshot::ProjectSnapshot {
             sites: self.sites.clone(),
             zones: self.zones.clone(),
             click_through_urls: self.click_through_urls.clone(),
+            creatives: self.creatives.clone(),
             hmac_secret: self.hmac_secret.clone(),
             hmac_secret_previous: self.hmac_secret_previous.clone(),
             allow_force_decision: self.allow_force_decision,

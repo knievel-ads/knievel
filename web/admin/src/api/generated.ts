@@ -1241,6 +1241,14 @@ export interface components {
             site_id: number;
             click_url: string;
             impression_url: string;
+            /**
+             * @description The selected ad's creative, typed by `kind` (`API.md` § 1
+             *     `oneOf`). `null` when the ad has no creative attached or the
+             *     snapshot hasn't loaded it yet. For `templated` creatives the
+             *     `body` is rendered server-side at decision time; the other
+             *     kinds carry their stored fields verbatim.
+             */
+            creative?: Omit<components["schemas"]["DecisionCreative"], "type"> & unknown;
         };
         /** DecisionBlock */
         DecisionBlock: {
@@ -1254,6 +1262,60 @@ export interface components {
             referrer?: string;
             user_agent?: string;
         };
+        /**
+         * @description The decision response's typed creative block — a discriminated
+         *     union on `type` mirroring `API.md` § 1 / § 3.5. The four arms
+         *     match the four creative `kind`s.
+         */
+        DecisionCreative: components["schemas"]["DecisionCreative_ImageCreative"] | components["schemas"]["DecisionCreative_HtmlCreative"] | components["schemas"]["DecisionCreative_NativeCreative"] | components["schemas"]["DecisionCreative_TemplatedCreative"];
+        /**
+         * @description The decision response's typed creative block — a discriminated
+         *     union on `type` mirroring `API.md` § 1 / § 3.5. The four arms
+         *     match the four creative `kind`s.
+         */
+        DecisionCreative_HtmlCreative: {
+            /**
+             * @example html
+             * @enum {string}
+             */
+            type: "html";
+        } & components["schemas"]["HtmlCreative"];
+        /**
+         * @description The decision response's typed creative block — a discriminated
+         *     union on `type` mirroring `API.md` § 1 / § 3.5. The four arms
+         *     match the four creative `kind`s.
+         */
+        DecisionCreative_ImageCreative: {
+            /**
+             * @example image
+             * @enum {string}
+             */
+            type: "image";
+        } & components["schemas"]["ImageCreative"];
+        /**
+         * @description The decision response's typed creative block — a discriminated
+         *     union on `type` mirroring `API.md` § 1 / § 3.5. The four arms
+         *     match the four creative `kind`s.
+         */
+        DecisionCreative_NativeCreative: {
+            /**
+             * @example native
+             * @enum {string}
+             */
+            type: "native";
+        } & components["schemas"]["NativeCreative"];
+        /**
+         * @description The decision response's typed creative block — a discriminated
+         *     union on `type` mirroring `API.md` § 1 / § 3.5. The four arms
+         *     match the four creative `kind`s.
+         */
+        DecisionCreative_TemplatedCreative: {
+            /**
+             * @example templated
+             * @enum {string}
+             */
+            type: "templated";
+        } & components["schemas"]["TemplatedCreative"];
         /** DecisionPlacement */
         DecisionPlacement: {
             id: string;
@@ -1372,6 +1434,22 @@ export interface components {
             /** Format: int64 */
             creative_id?: number;
         };
+        /** HtmlCreative */
+        HtmlCreative: {
+            /** @description Verbatim HTML stored on the creative, returned as-is. */
+            body?: string;
+            click_through_url?: string;
+        };
+        /** ImageCreative */
+        ImageCreative: {
+            image_url?: string;
+            /** Format: int32 */
+            width?: number;
+            /** Format: int32 */
+            height?: number;
+            alt?: string;
+            click_through_url?: string;
+        };
         /** IssuerSummary */
         IssuerSummary: {
             issuer: string;
@@ -1385,6 +1463,16 @@ export interface components {
              */
             claim_source: string;
             jwks_url?: string;
+        };
+        /** NativeCreative */
+        NativeCreative: {
+            /**
+             * @description The referenced template's name; the caller renders `values`
+             *     client-side using its own components.
+             */
+            template?: string;
+            values: unknown;
+            click_through_url?: string;
         };
         /**
          * OrgResponse
@@ -1459,6 +1547,20 @@ export interface components {
         SiteList: {
             items: components["schemas"]["Site"][];
             next_cursor?: string;
+        };
+        /** TemplatedCreative */
+        TemplatedCreative: {
+            /** @description The referenced template's name. */
+            template?: string;
+            /** @description Echoed so callers can re-render or inspect. */
+            values: unknown;
+            /**
+             * @description The template's Liquid source rendered against `values` plus
+             *     the injected decision context (signed URLs, placement id,
+             *     snapshot version) at decision time.
+             */
+            body: string;
+            click_through_url?: string;
         };
         /** TokenListResponse */
         TokenListResponse: {

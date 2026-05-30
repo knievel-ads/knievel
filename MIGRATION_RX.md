@@ -25,6 +25,20 @@ CREATE ROLE knievel_app LOGIN PASSWORD :'knievel_password';
 GRANT USAGE, CREATE ON SCHEMA knievel TO knievel_app;
 
 ALTER ROLE knievel_app SET search_path = knievel, public;
+
+-- Background-loader role. BYPASSRLS so the in-process snapshot loader
+-- (and the rollup) read across tenants — the request path keeps strict
+-- per-tenant RLS and never assumes this role. NOLOGIN: the app role
+-- `SET LOCAL ROLE knievel_loader` for its background reads (transaction-
+-- scoped, so it can't leak onto request connections). Only a superuser
+-- can grant BYPASSRLS, so this is a one-time provisioning step.
+CREATE ROLE knievel_loader NOLOGIN BYPASSRLS;
+GRANT knievel_loader TO knievel_app;
+GRANT USAGE ON SCHEMA knievel TO knievel_loader;
+ALTER DEFAULT PRIVILEGES FOR ROLE knievel_app IN SCHEMA knievel
+  GRANT SELECT ON TABLES TO knievel_loader;
+ALTER DEFAULT PRIVILEGES FOR ROLE knievel_app IN SCHEMA knievel
+  GRANT SELECT ON SEQUENCES TO knievel_loader;
 ```
 
 `knievel_app` has **no grants on RX's tables**. Defense in depth

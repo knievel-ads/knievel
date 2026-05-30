@@ -199,6 +199,159 @@ where
     }
 }
 
+/// Concrete snapshot reload: read every project's config from the DB
+/// into a fresh [`Snapshot`]. This is the function `run_loader` calls.
+///
+/// Cross-tenant by necessity — one process serves all projects — so it
+/// reads under `SET LOCAL ROLE knievel_loader`, a `BYPASSRLS`
+/// background-only role provisioned by the operator (see
+/// `MIGRATION_RX.md`). The per-request path keeps strict per-tenant
+/// RLS; only this trusted in-process loader is exempt. `SET LOCAL`
+/// scopes the role to this one transaction, so it can never leak back
+/// onto the pool's request-serving connections.
+pub async fn load_snapshot(pool: PgPool) -> Result<Snapshot> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL ROLE knievel_loader")
+        .execute(&mut *tx)
+        .await?;
+
+    let config_version: i64 = sqlx::query("SELECT last_value FROM knievel.config_version")
+        .fetch_one(&mut *tx)
+        .await?
+        .try_get(0)?;
+
+    // Seed one ProjectSnapshot per active project.
+    let mut projects: HashMap<String, ProjectSnapshot> = HashMap::new();
+    for r in sqlx::query(
+        "SELECT id, org_id, hmac_secret, allow_force_decision \
+         FROM knievel.projects WHERE is_active",
+    )
+    .fetch_all(&mut *tx)
+    .await?
+    {
+        let id: String = r.try_get("id")?;
+        projects.insert(
+            id.clone(),
+            ProjectSnapshot {
+                project_id: id,
+                org_id_for_event: r.try_get("org_id")?,
+                hmac_secret: r.try_get("hmac_secret")?,
+                // Rotation overlap (hmac_secret_previous) is not modeled
+                // on the projects row yet; None = no previous secret.
+                hmac_secret_previous: None,
+                allow_force_decision: r.try_get("allow_force_decision")?,
+                ..Default::default()
+            },
+        );
+    }
+
+    // Flights — join priorities for the numeric tier; dates → epoch ms.
+    for r in sqlx::query(
+        "SELECT f.project_id, f.id, f.campaign_id, c.advertiser_id, p.tier, \
+                (extract(epoch from f.start_date) * 1000)::bigint AS start_ms, \
+                (extract(epoch from f.end_date)   * 1000)::bigint AS end_ms, \
+                f.site_ids, f.zone_ids, f.ad_types, f.is_active \
+         FROM knievel.flights f \
+         JOIN knievel.priorities p ON p.id = f.priority_id \
+         JOIN knievel.campaigns  c ON c.id = f.campaign_id",
+    )
+    .fetch_all(&mut *tx)
+    .await?
+    {
+        let pid: String = r.try_get("project_id")?;
+        if let Some(proj) = projects.get_mut(&pid) {
+            proj.flights.push(crate::selection::Flight {
+                id: r.try_get("id")?,
+                campaign_id: r.try_get("campaign_id")?,
+                advertiser_id: r.try_get("advertiser_id")?,
+                priority_tier: r.try_get("tier")?,
+                start_ms: r.try_get("start_ms")?,
+                end_ms: r.try_get("end_ms")?,
+                site_ids: r.try_get("site_ids")?,
+                zone_ids: r.try_get("zone_ids")?,
+                ad_types: r.try_get("ad_types")?,
+                is_active: r.try_get("is_active")?,
+            });
+        }
+    }
+
+    // Ads.
+    for r in sqlx::query(
+        "SELECT project_id, id, flight_id, creative_id, weight, is_active FROM knievel.ads",
+    )
+    .fetch_all(&mut *tx)
+    .await?
+    {
+        let pid: String = r.try_get("project_id")?;
+        if let Some(proj) = projects.get_mut(&pid) {
+            proj.ads.push(crate::selection::Ad {
+                id: r.try_get("id")?,
+                flight_id: r.try_get("flight_id")?,
+                creative_id: r.try_get("creative_id")?,
+                weight: r.try_get("weight")?,
+                is_active: r.try_get("is_active")?,
+            });
+        }
+    }
+
+    // Sites.
+    for r in sqlx::query("SELECT project_id, id, url, aliases FROM knievel.sites")
+        .fetch_all(&mut *tx)
+        .await?
+    {
+        let pid: String = r.try_get("project_id")?;
+        if let Some(proj) = projects.get_mut(&pid) {
+            proj.sites.push(SnapshotSite {
+                id: r.try_get("id")?,
+                url: r.try_get("url")?,
+                aliases: r.try_get("aliases")?,
+            });
+        }
+    }
+
+    // Zones.
+    for r in sqlx::query("SELECT project_id, id, site_id FROM knievel.zones")
+        .fetch_all(&mut *tx)
+        .await?
+    {
+        let pid: String = r.try_get("project_id")?;
+        if let Some(proj) = projects.get_mut(&pid) {
+            proj.zones.push(SnapshotZone {
+                id: r.try_get("id")?,
+                site_id: r.try_get("site_id")?,
+            });
+        }
+    }
+
+    // click_through_urls: ad_id → its creative's click_through_url.
+    for r in sqlx::query(
+        "SELECT a.project_id, a.id AS ad_id, c.click_through_url \
+         FROM knievel.ads a \
+         JOIN knievel.creatives c ON c.id = a.creative_id \
+         WHERE c.click_through_url IS NOT NULL",
+    )
+    .fetch_all(&mut *tx)
+    .await?
+    {
+        let pid: String = r.try_get("project_id")?;
+        if let Some(proj) = projects.get_mut(&pid) {
+            let ad_id: i64 = r.try_get("ad_id")?;
+            let url: String = r.try_get("click_through_url")?;
+            proj.click_through_urls.insert(ad_id, url);
+        }
+    }
+
+    tx.commit().await?;
+
+    Ok(Snapshot {
+        config_version,
+        projects: projects
+            .into_iter()
+            .map(|(k, v)| (k, Arc::new(v)))
+            .collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

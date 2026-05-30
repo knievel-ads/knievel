@@ -431,6 +431,17 @@ async fn finish_state_with_pool(
     );
     let _rollup_task = rollup::spawn(pool.clone(), leader_handle.clone());
 
+    // Snapshot loader runs on EVERY pod (not leader-gated): each pod
+    // keeps its own in-RAM read cache of the decision config, cold-loaded
+    // at boot and refreshed on every `config_version` bump. Without it
+    // the decision path serves `503 snapshot_cold`.
+    let snapshot_store = crate::snapshot::SnapshotStore::empty();
+    let _snapshot_task = tokio::spawn(crate::snapshot::run_loader(
+        pool.clone(),
+        snapshot_store.clone(),
+        crate::snapshot::load_snapshot,
+    ));
+
     tracing::info!(
         db = "connected",
         schema = schema_status,
@@ -438,13 +449,15 @@ async fn finish_state_with_pool(
         image_store = "in_memory",
         events = "on",
         leader = "follower",
+        snapshot = "loading",
         "knievel boot ready"
     );
 
     Ok(base_state
         .with_db(pool)
         .with_events(sender)
-        .with_leader(leader_handle))
+        .with_leader(leader_handle)
+        .with_snapshot(snapshot_store))
 }
 
 /// Connect with the same `after_connect` recipe `testlib` uses

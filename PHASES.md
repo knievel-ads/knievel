@@ -2368,6 +2368,34 @@ re-prioritize within the phase.
       footnote), `PHASES.md` § 3.33 note,
       `https://github.com/poem-web/poem` (upstream).
 
+- [x] **6.7** Snapshot loader + BYPASSRLS loader role. The decision
+      path read an in-RAM `Snapshot` that nothing ever populated —
+      `run_loader` (`snapshot.rs`) had no concrete `reload` fn and was
+      never spawned, so `/decisions` served `503 snapshot_cold` in
+      prod. Lands `snapshot::load_snapshot`: reads every active
+      project's flights (join campaigns for `advertiser_id`,
+      priorities for the tier, dates→epoch ms), ads (with `creative_id`,
+      new on `selection::Ad`), sites, zones, and per-ad
+      `click_through_urls`, keyed by project. Spawned un-gated at boot
+      (every pod keeps its own cache; `server.rs`). Cross-tenant reads
+      use `SET LOCAL ROLE knievel_loader`, a `BYPASSRLS` NOLOGIN role
+      (operator-provisioned — only a superuser can grant BYPASSRLS;
+      `examples/compose/init.sql`, `MIGRATION_RX.md`, testlib). The
+      role is transaction-scoped so it can never leak onto a
+      request-serving connection; the cross-tenant isolation suite
+      still passes. Integration test seeds a full demo project and
+      asserts the loader carries it.
+      Refs: `REQUIREMENTS.md` § 7.2.
+
+      **Note (6.7):** Decision-time *rendering* (the `templated`
+      creative `body` in the response) is the follow-up (6.8) — this
+      commit only makes the loader populate the snapshot so selection
+      has data. The rollup task (`rollup.rs`) has the same
+      cross-tenant-read bug (reads `events_raw` on the raw pool, no
+      GUC → 0 rows under FORCE'd RLS); fixing it to `SET LOCAL ROLE
+      knievel_loader` (plus the loader role's INSERT/UPDATE grants on
+      the rollup tables) is a small follow-up bundled with 6.8.
+
 **Milestone:** `:batchUpsert` is consistent across every
 resource that declares it; POST creates are truly idempotent;
 handler bodies are short again. Every list endpoint in

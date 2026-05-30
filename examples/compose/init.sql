@@ -27,3 +27,21 @@ GRANT ALL PRIVILEGES ON DATABASE knievel TO knievel_app;
 GRANT ALL PRIVILEGES ON SCHEMA public TO knievel_app;
 CREATE SCHEMA IF NOT EXISTS knievel AUTHORIZATION knievel_app;
 ALTER ROLE knievel_app SET search_path = knievel, public;
+
+-- Background-loader role. BYPASSRLS so the in-process snapshot loader
+-- (and the rollup) can read across tenants — the request path keeps
+-- strict per-tenant RLS and never assumes this role. NOLOGIN: the app
+-- role `SET LOCAL ROLE knievel_loader` for its background reads. Only a
+-- superuser can grant BYPASSRLS, so this runs at provisioning time, not
+-- via the app's auto_migrate.
+DO $$ BEGIN
+  CREATE ROLE knievel_loader NOLOGIN BYPASSRLS;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+GRANT knievel_loader TO knievel_app;
+GRANT USAGE ON SCHEMA knievel TO knievel_loader;
+-- Tables/sequences are created later by auto_migrate (as knievel_app);
+-- default privileges auto-grant the loader SELECT on each as it lands.
+ALTER DEFAULT PRIVILEGES FOR ROLE knievel_app IN SCHEMA knievel
+  GRANT SELECT ON TABLES TO knievel_loader;
+ALTER DEFAULT PRIVILEGES FOR ROLE knievel_app IN SCHEMA knievel
+  GRANT SELECT ON SEQUENCES TO knievel_loader;

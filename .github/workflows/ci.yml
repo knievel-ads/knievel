@@ -89,6 +89,12 @@ jobs:
             CREATE ROLE knievel_app WITH NOSUPERUSER CREATEDB LOGIN PASSWORD 'dev';
             GRANT ALL PRIVILEGES ON DATABASE knievel TO knievel_app;
             GRANT ALL PRIVILEGES ON SCHEMA public TO knievel_app;
+            -- BYPASSRLS background-loader role (snapshot loader / rollup).
+            -- Created here as the bootstrap superuser since only a
+            -- superuser can grant BYPASSRLS; testlib's ephemerals then
+            -- grant it per-DB SELECTs. The request path never assumes it.
+            DO $$ BEGIN CREATE ROLE knievel_loader NOLOGIN BYPASSRLS; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+            GRANT knievel_loader TO knievel_app;
           EOSQL
       - run: |
           cargo nextest run --workspace --locked \
@@ -125,6 +131,12 @@ jobs:
             CREATE ROLE knievel_app WITH NOSUPERUSER CREATEDB LOGIN PASSWORD 'dev';
             GRANT ALL PRIVILEGES ON DATABASE knievel TO knievel_app;
             GRANT ALL PRIVILEGES ON SCHEMA public TO knievel_app;
+            -- BYPASSRLS background-loader role (snapshot loader / rollup).
+            -- Created here as the bootstrap superuser since only a
+            -- superuser can grant BYPASSRLS; testlib's ephemerals then
+            -- grant it per-DB SELECTs. The request path never assumes it.
+            DO $$ BEGIN CREATE ROLE knievel_loader NOLOGIN BYPASSRLS; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+            GRANT knievel_loader TO knievel_app;
           EOSQL
       - run: |
           cargo nextest run --workspace --locked \
@@ -567,6 +579,12 @@ jobs:
             CREATE ROLE knievel_app WITH NOSUPERUSER CREATEDB LOGIN PASSWORD 'dev';
             GRANT ALL PRIVILEGES ON DATABASE knievel TO knievel_app;
             GRANT ALL PRIVILEGES ON SCHEMA public TO knievel_app;
+            -- BYPASSRLS background-loader role (snapshot loader / rollup).
+            -- Created here as the bootstrap superuser since only a
+            -- superuser can grant BYPASSRLS; testlib's ephemerals then
+            -- grant it per-DB SELECTs. The request path never assumes it.
+            DO $$ BEGIN CREATE ROLE knievel_loader NOLOGIN BYPASSRLS; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+            GRANT knievel_loader TO knievel_app;
           EOSQL
       - name: Run shard ${{ matrix.shard }}/4
         run: |

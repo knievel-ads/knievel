@@ -51,6 +51,11 @@ pub struct Flight {
 pub struct Ad {
     pub id: i64,
     pub flight_id: i64,
+    /// The creative this ad serves. `None` for ads with no creative
+    /// attached yet. Carried so the decision handler can name the
+    /// creative (and render it) without a second round-trip — the
+    /// selection algorithm itself doesn't read it.
+    pub creative_id: Option<i64>,
     pub weight: i32,
     pub is_active: bool,
 }
@@ -231,6 +236,7 @@ mod tests {
         Ad {
             id,
             flight_id,
+            creative_id: None,
             weight,
             is_active: true,
         }

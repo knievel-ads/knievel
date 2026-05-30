@@ -68,6 +68,23 @@ pub async fn ephemeral() -> Result<EphemeralDb> {
                 .await
                 .context("checking admin role attributes")?;
         if is_super {
+            // Provision the BYPASSRLS background-loader role while we're
+            // still superuser — only a superuser can grant BYPASSRLS.
+            // Cluster-global and idempotent across concurrent ephemerals.
+            // The in-process snapshot loader and rollup `SET LOCAL ROLE`
+            // to it for cross-tenant reads; the request path never does.
+            sqlx::query(
+                "DO $$ BEGIN \
+                   CREATE ROLE knievel_loader NOLOGIN BYPASSRLS; \
+                 EXCEPTION WHEN duplicate_object THEN NULL; END $$",
+            )
+            .execute(&mut *tx)
+            .await
+            .context("creating knievel_loader role")?;
+            sqlx::query("GRANT knievel_loader TO current_user")
+                .execute(&mut *tx)
+                .await
+                .context("granting knievel_loader to app role")?;
             // Wrap the ALTER in a savepoint so a failure (some
             // managed Postgres tiers refuse self-alter even from
             // a SUPERUSER; observed once on a CI Postgres 16 run)
@@ -200,6 +217,25 @@ pub async fn ephemeral() -> Result<EphemeralDb> {
         .await
         .context("loading migrations")?;
     migrator.run(&pool).await.context("applying migrations")?;
+
+    // Grant the BYPASSRLS loader role SELECT on this DB's tables and
+    // sequences (`config_version` is a sequence). The app role owns them
+    // so it can grant; BYPASSRLS exempts the loader from RLS but not from
+    // table privileges. Guarded on the role existing — it's provisioned
+    // out-of-band (the superuser branch above, ci.yml, or compose init);
+    // if absent, only loader-dependent tests fail, not the whole DB suite.
+    sqlx::query(
+        "DO $$ BEGIN \
+           IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'knievel_loader') THEN \
+             GRANT USAGE ON SCHEMA knievel TO knievel_loader; \
+             GRANT SELECT ON ALL TABLES IN SCHEMA knievel TO knievel_loader; \
+             GRANT SELECT ON ALL SEQUENCES IN SCHEMA knievel TO knievel_loader; \
+           END IF; \
+         END $$",
+    )
+    .execute(&pool)
+    .await
+    .context("granting loader role privileges")?;
 
     Ok(EphemeralDb { pool, url, name })
 }

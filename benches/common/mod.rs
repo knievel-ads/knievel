@@ -98,6 +98,7 @@ pub fn synthesize_snapshot(shape: SnapshotShape) -> ProjectSnapshot {
             ads.push(Ad {
                 id: ad_id,
                 flight_id: id,
+                creative_id: None,
                 weight,
                 is_active: true,
             });

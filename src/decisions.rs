@@ -1027,6 +1027,7 @@ mod tests {
         p.ads.push(SelAd {
             id: 99,
             flight_id: 10,
+            creative_id: None,
             weight: 1,
             is_active: true,
         });

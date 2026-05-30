@@ -64,6 +64,14 @@ pub struct ProjectSnapshot {
     /// no `clickThroughUrl` simply don't appear here — the
     /// click handler falls through to a safe placeholder.
     pub click_through_urls: HashMap<i64, String>,
+    /// `creative_id → creative` lookup for the decision response's
+    /// typed `creative` block (`API.md` § 1 / § 3.5). Carries the
+    /// per-kind fields plus, for `templated` creatives, the Liquid
+    /// source pulled from the joined template so the decision
+    /// handler can render `body` server-side with no DB round-trip
+    /// (Phase 6.8). Keyed on creative_id; an ad whose `creative_id`
+    /// isn't here simply gets a null `creative`.
+    pub creatives: HashMap<i64, SnapshotCreative>,
     /// Current HMAC signing secret. The decision endpoint signs
     /// new URLs with this; the event endpoints accept either
     /// this OR `hmac_secret_previous` (during the 8 h overlap).
@@ -77,6 +85,40 @@ pub struct SnapshotSite {
     pub id: i64,
     pub url: String,
     pub aliases: Vec<String>,
+}
+
+/// A creative as the decision path sees it. Mirrors the
+/// `API.md` § 3.5 `oneOf` (the `kind` column is the
+/// discriminator) and carries the joined template's `name` and
+/// Liquid `source` so the decision handler can build the typed
+/// `creative` block — and render `templated` bodies — entirely
+/// from RAM.
+#[derive(Debug, Clone)]
+pub struct SnapshotCreative {
+    pub id: i64,
+    /// `image` | `html` | `native` | `templated`.
+    pub kind: String,
+    pub image_url: Option<String>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub alt: Option<String>,
+    /// Verbatim HTML for `html` creatives.
+    pub body: Option<String>,
+    /// The referenced template's `name` (`creative_templates.name`),
+    /// echoed as `creative.template` in the decision response for
+    /// `native`/`templated` creatives. `None` for image/html.
+    pub template_name: Option<String>,
+    /// The referenced template's Liquid `source`
+    /// (`creative_templates.template`). Present only when the
+    /// template carries a renderable body — i.e. for `templated`
+    /// creatives. `native` creatives leave this `None` (the caller
+    /// renders client-side).
+    pub template_source: Option<String>,
+    /// The creative's `values` map. Defaults to an empty object
+    /// when the column is NULL so the renderer and the wire shape
+    /// always see an object.
+    pub values: serde_json::Value,
+    pub click_through_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -341,6 +383,50 @@ pub async fn load_snapshot(pool: PgPool) -> Result<Snapshot> {
         }
     }
 
+    // Creatives — keyed by creative_id, with the template name +
+    // Liquid source joined in for `native`/`templated` rendering.
+    //
+    // The `ct.project_id = c.project_id` predicate is load-bearing:
+    // this runs under the BYPASSRLS loader role, and the creatives FK
+    // on `template_id` references the *global* template PK, so without
+    // it a creative that somehow carried another project's template_id
+    // would pull that tenant's template name/source into this
+    // project's map. The same-project guard makes the loader
+    // self-defending regardless of how the row was written.
+    for r in sqlx::query(
+        "SELECT c.project_id, c.id, c.kind, c.image_url, c.width, c.height, \
+                c.alt, c.body, c.values, c.click_through_url, \
+                ct.name AS template_name, ct.template AS template_source \
+         FROM knievel.creatives c \
+         LEFT JOIN knievel.creative_templates ct \
+                ON ct.id = c.template_id AND ct.project_id = c.project_id",
+    )
+    .fetch_all(&mut *tx)
+    .await?
+    {
+        let pid: String = r.try_get("project_id")?;
+        if let Some(proj) = projects.get_mut(&pid) {
+            let id: i64 = r.try_get("id")?;
+            let values: Option<serde_json::Value> = r.try_get("values")?;
+            proj.creatives.insert(
+                id,
+                SnapshotCreative {
+                    id,
+                    kind: r.try_get("kind")?,
+                    image_url: r.try_get("image_url")?,
+                    width: r.try_get("width")?,
+                    height: r.try_get("height")?,
+                    alt: r.try_get("alt")?,
+                    body: r.try_get("body")?,
+                    template_name: r.try_get("template_name")?,
+                    template_source: r.try_get("template_source")?,
+                    values: values.unwrap_or_else(|| serde_json::json!({})),
+                    click_through_url: r.try_get("click_through_url")?,
+                },
+            );
+        }
+    }
+
     tx.commit().await?;
 
     Ok(Snapshot {
@@ -408,6 +494,7 @@ mod tests {
         assert!(p.hmac_secret_previous.is_none());
         assert!(p.org_id_for_event.is_empty());
         assert!(p.click_through_urls.is_empty());
+        assert!(p.creatives.is_empty());
         assert!(!p.allow_force_decision);
     }
 }

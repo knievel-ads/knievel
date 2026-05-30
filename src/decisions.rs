@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api_tags::ApiTags;
 use poem::web::Data;
-use poem_openapi::{param::Path, payload::Json, ApiResponse, Object, OpenApi};
+use poem_openapi::{param::Path, payload::Json, ApiResponse, Object, OpenApi, Union};
 use sqlx::{Postgres, Transaction};
 
 use crate::auth::security::BearerAuth;
@@ -31,8 +31,9 @@ use crate::handlers::{open_project_tx, AuthzError};
 use crate::hmac::{self, SignaturePayload};
 use crate::idempotency;
 use crate::orgs::{ErrorBody, ErrorEnvelope};
+use crate::rendering::{self, RenderCtx};
 use crate::selection::{self, BlockSet, Candidate, Placement};
-use crate::snapshot::ProjectSnapshot;
+use crate::snapshot::{ProjectSnapshot, SnapshotCreative};
 use crate::state::AppState;
 
 pub struct DecisionsApi;
@@ -92,6 +93,62 @@ pub struct DecisionAd {
     pub site_id: i64,
     pub click_url: String,
     pub impression_url: String,
+    /// The selected ad's creative, typed by `kind` (`API.md` § 1
+    /// `oneOf`). `null` when the ad has no creative attached or the
+    /// snapshot hasn't loaded it yet. For `templated` creatives the
+    /// `body` is rendered server-side at decision time; the other
+    /// kinds carry their stored fields verbatim.
+    pub creative: Option<DecisionCreative>,
+}
+
+/// The decision response's typed creative block — a discriminated
+/// union on `type` mirroring `API.md` § 1 / § 3.5. The four arms
+/// match the four creative `kind`s.
+#[derive(Union, serde::Serialize, serde::Deserialize)]
+#[oai(discriminator_name = "type", rename_all = "lowercase")]
+pub enum DecisionCreative {
+    Image(ImageCreative),
+    Html(HtmlCreative),
+    Native(NativeCreative),
+    Templated(TemplatedCreative),
+}
+
+#[derive(Object, serde::Serialize, serde::Deserialize)]
+pub struct ImageCreative {
+    pub image_url: Option<String>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub alt: Option<String>,
+    pub click_through_url: Option<String>,
+}
+
+#[derive(Object, serde::Serialize, serde::Deserialize)]
+pub struct HtmlCreative {
+    /// Verbatim HTML stored on the creative, returned as-is.
+    pub body: Option<String>,
+    pub click_through_url: Option<String>,
+}
+
+#[derive(Object, serde::Serialize, serde::Deserialize)]
+pub struct NativeCreative {
+    /// The referenced template's name; the caller renders `values`
+    /// client-side using its own components.
+    pub template: Option<String>,
+    pub values: serde_json::Value,
+    pub click_through_url: Option<String>,
+}
+
+#[derive(Object, serde::Serialize, serde::Deserialize)]
+pub struct TemplatedCreative {
+    /// The referenced template's name.
+    pub template: Option<String>,
+    /// Echoed so callers can re-render or inspect.
+    pub values: serde_json::Value,
+    /// The template's Liquid source rendered against `values` plus
+    /// the injected decision context (signed URLs, placement id,
+    /// snapshot version) at decision time.
+    pub body: String,
+    pub click_through_url: Option<String>,
 }
 
 #[derive(Object, serde::Serialize, serde::Deserialize)]
@@ -219,27 +276,68 @@ pub fn decide_pure(
 
         let mut placement_out = Vec::with_capacity(picks.len());
         for c in &picks {
+            // `creative_id` is the real id when the ad carries a
+            // creative, else the `0` sentinel (matching the event
+            // layer's "0 = unattributed" convention). It is signed
+            // into the URL payload AND surfaced on the response.
+            let creative_id = c.ad.creative_id.unwrap_or(0);
             let nonce = mint_nonce(now_ms, c.ad.id);
             let payload = SignaturePayload {
                 project_id: project_id.to_string(),
                 ad_id: c.ad.id,
-                creative_id: 0,
+                creative_id,
                 placement_id_hash: hmac::placement_id_hash(project_id, &placement.id),
                 issued_at_secs: now_secs,
                 nonce,
             };
-            let click_signed = hmac::sign(&payload, &project.hmac_secret);
-            let imp_signed = hmac::sign(&payload, &project.hmac_secret);
+            // click and impression URLs share one signature (the
+            // payload is identical); the `/e/c` vs `/e/i` path is
+            // what distinguishes the two events.
+            let signed = hmac::sign(&payload, &project.hmac_secret);
+            let click_url = format!("/e/c/{signed}");
+            let impression_url = format!("/e/i/{signed}");
+
+            // Build the typed creative block from the snapshot. For
+            // `templated` creatives this renders the Liquid `body`
+            // against the freshly-signed URLs; a render failure
+            // no-fills this ad (skip both the push and the event)
+            // rather than failing the whole request.
+            let creative = match c.ad.creative_id.and_then(|cid| project.creatives.get(&cid)) {
+                Some(sc) => {
+                    let ctx = RenderCtx {
+                        ad_id: c.ad.id,
+                        click_url: &click_url,
+                        impression_url: &impression_url,
+                        placement_id: &placement.id,
+                        snapshot_version,
+                    };
+                    match build_decision_creative(sc, ctx) {
+                        Ok(dc) => Some(dc),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                ad_id = c.ad.id,
+                                creative_id,
+                                "creative render failed; no-filling ad"
+                            );
+                            continue;
+                        }
+                    }
+                }
+                None => None,
+            };
+
             placement_out.push(DecisionAd {
                 ad_id: c.ad.id,
-                creative_id: 0,
+                creative_id,
                 flight_id: c.flight.id,
                 campaign_id: c.flight.campaign_id,
                 advertiser_id: c.flight.advertiser_id,
                 priority_id: c.flight.priority_tier as i64,
                 site_id: resolved,
-                click_url: format!("/e/c/{click_signed}"),
-                impression_url: format!("/e/i/{imp_signed}"),
+                click_url,
+                impression_url,
+                creative,
             });
             events_to_send.push(decision_event(
                 principal,
@@ -490,6 +588,53 @@ fn forced_candidate(project: &ProjectSnapshot, ad_id: i64) -> Option<Candidate<'
     Some(Candidate { ad, flight })
 }
 
+/// Turn a snapshot creative into the typed decision-response
+/// `creative` block. Pure for `image`/`html`/`native`; for
+/// `templated` it renders the Liquid `source` against the
+/// creative's `values` plus `ctx` and returns the rendered HTML in
+/// `body`. Returns `Err` only when a `templated` creative fails to
+/// render (missing source, parse/render error, output over cap) —
+/// the caller no-fills that ad. An unknown `kind` is also an error
+/// (the DB CHECK constraint makes it unreachable, but no-filling is
+/// the safe failure mode).
+fn build_decision_creative(
+    c: &SnapshotCreative,
+    ctx: RenderCtx<'_>,
+) -> anyhow::Result<DecisionCreative> {
+    let dc = match c.kind.as_str() {
+        "image" => DecisionCreative::Image(ImageCreative {
+            image_url: c.image_url.clone(),
+            width: c.width,
+            height: c.height,
+            alt: c.alt.clone(),
+            click_through_url: c.click_through_url.clone(),
+        }),
+        "html" => DecisionCreative::Html(HtmlCreative {
+            body: c.body.clone(),
+            click_through_url: c.click_through_url.clone(),
+        }),
+        "native" => DecisionCreative::Native(NativeCreative {
+            template: c.template_name.clone(),
+            values: c.values.clone(),
+            click_through_url: c.click_through_url.clone(),
+        }),
+        "templated" => {
+            let source = c.template_source.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("templated creative {} has no template source", c.id)
+            })?;
+            let body = rendering::render_templated(source, &c.values, ctx)?;
+            DecisionCreative::Templated(TemplatedCreative {
+                template: c.template_name.clone(),
+                values: c.values.clone(),
+                body,
+                click_through_url: c.click_through_url.clone(),
+            })
+        }
+        other => anyhow::bail!("unknown creative kind {other:?}"),
+    };
+    Ok(dc)
+}
+
 /// Build a Decision event row for the COPY flusher.
 #[allow(clippy::too_many_arguments)]
 fn decision_event(
@@ -517,7 +662,10 @@ fn decision_event(
         site_id: Some(site_id),
         zone_id,
         ad_id: Some(cand.ad.id),
-        creative_id: None,
+        // Carry the ad's creative_id so the rollup can group by it
+        // (`events_rollup` keys on creative_id). `None` for ads with
+        // no creative attached.
+        creative_id: cand.ad.creative_id,
         flight_id: Some(cand.flight.id),
         campaign_id: Some(cand.flight.campaign_id),
         advertiser_id: Some(cand.flight.advertiser_id),
@@ -869,7 +1017,7 @@ impl ExplainApi {
                 let _ = all_pass;
                 candidates_out.push(ExplainCandidate {
                     ad_id: ad.id,
-                    creative_id: 0,
+                    creative_id: ad.creative_id.unwrap_or(0),
                     flight_id: flight.id,
                     campaign_id: flight.campaign_id,
                     advertiser_id: flight.advertiser_id,
@@ -922,7 +1070,7 @@ impl ExplainApi {
                         .iter()
                         .map(|c| DecisionAd {
                             ad_id: c.ad.id,
-                            creative_id: 0,
+                            creative_id: c.ad.creative_id.unwrap_or(0),
                             flight_id: c.flight.id,
                             campaign_id: c.flight.campaign_id,
                             advertiser_id: c.flight.advertiser_id,
@@ -931,9 +1079,14 @@ impl ExplainApi {
                             // Per spec: explainer URLs are
                             // dummy placeholders, marked as such
                             // so callers don't accidentally serve
-                            // them.
+                            // them. The explainer is a read-only
+                            // debug surface — it doesn't render the
+                            // creative block (the dummy URLs would
+                            // make a rendered body misleading), so
+                            // `creative` is left null here.
                             click_url: "/e/c/__explain_dummy__".into(),
                             impression_url: "/e/i/__explain_dummy__".into(),
+                            creative: None,
                         })
                         .collect();
                     decisions.insert(placement.id.clone(), placement_decisions);

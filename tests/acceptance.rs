@@ -64,6 +64,21 @@ fn build_app(pool: sqlx::PgPool) -> impl poem::Endpoint {
     knievel::server::routes().data(state)
 }
 
+/// Like `build_app`, but cold-loads the decision snapshot from the DB
+/// first so the decision hot path has data (otherwise `/decisions`
+/// returns `503 snapshot_cold`). Production spawns the loader as a
+/// background task; tests invoke `load_snapshot` directly for a
+/// deterministic, single point-in-time view.
+async fn build_app_with_snapshot(pool: sqlx::PgPool) -> Result<impl poem::Endpoint> {
+    let snapshot = knievel::snapshot::SnapshotStore::new(
+        knievel::snapshot::load_snapshot(pool.clone()).await?,
+    );
+    let state = knievel::state::AppState::new()
+        .with_db(pool)
+        .with_snapshot(snapshot);
+    Ok(knievel::server::routes().data(state))
+}
+
 fn skip_if_no_db() -> bool {
     if std::env::var("DATABASE_URL").is_err() {
         eprintln!("DATABASE_URL not set; skipping.");
@@ -103,13 +118,12 @@ async fn acc_01_provision_org_project_token_list() -> Result<()> {
 /// Ad → Creative; issue a decision; assert the response shape and
 /// HMAC URLs. Refs: `API.md` § 1, 3.1–3.5.
 #[tokio::test]
-#[ignore = "blocked on the snapshot loader being wired into the in-process AppState used by tests; today the decisions handler returns 503 snapshot_cold because the loader hasn't populated the snapshot for the seeded project. Lands when the snapshot reload function is exposed for direct invocation (PHASES.md 3.30 follow-up)"]
 async fn acc_02_demand_chain_decision_response_shape() -> Result<()> {
     if skip_if_no_db() {
         return Ok(());
     }
     let f = setup().await?;
-    let cli = TestClient::new(build_app(f.db.pool.clone()));
+    let cli = TestClient::new(build_app_with_snapshot(f.db.pool.clone()).await?);
 
     // The seed-demo already provisioned the demand chain; issue a
     // decision and assert the response.
@@ -137,6 +151,18 @@ async fn acc_02_demand_chain_decision_response_shape() -> Result<()> {
     assert!(
         placement.is_array(),
         "decisions[id] is always an array per API.md § 1"
+    );
+    // The seeded ad carries an `image` creative; the decision now
+    // surfaces the typed creative block (Phase 6.8).
+    let ad = &placement[0];
+    assert_eq!(
+        ad["creative"]["type"],
+        json!("image"),
+        "typed creative block"
+    );
+    assert!(
+        ad["creative_id"].as_i64().unwrap_or(0) > 0,
+        "real creative_id"
     );
 
     testlib::db::ephemeral_drop(f.db).await?;

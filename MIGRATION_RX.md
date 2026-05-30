@@ -41,6 +41,27 @@ ALTER DEFAULT PRIVILEGES FOR ROLE knievel_app IN SCHEMA knievel
   GRANT SELECT ON SEQUENCES TO knievel_loader;
 ```
 
+The SELECT default-privilege grant covers the snapshot loader. The
+hourly **rollup** is the other `SET LOCAL ROLE knievel_loader` path,
+and it *writes*: it INSERT/UPDATEs `events_rollup` (the `ON CONFLICT
+DO UPDATE` needs both) and UPDATEs the single-row
+`events_rollup_watermark`. BYPASSRLS exempts the loader from RLS but
+**not** from table privileges, so grant those two tables explicitly
+**after the first migration run** (they don't exist at role-creation
+time):
+
+```sql
+GRANT INSERT, UPDATE ON knievel.events_rollup           TO knievel_loader;
+GRANT UPDATE         ON knievel.events_rollup_watermark TO knievel_loader;
+```
+
+Granting just these two tables (rather than broad default
+INSERT/UPDATE) keeps the loader read-only everywhere except the
+rollup output — the request path never assumes the role, but
+least-privilege bounds the blast radius if a future code path ever
+did. (The compose dev stack over-grants via default privileges for
+convenience; production should pin the two tables as above.)
+
 `knievel_app` has **no grants on RX's tables**. Defense in depth
 against accidental joins or query bugs. Knievel does not require
 `pg_partman` or any other non-vanilla extension — partition lifecycle

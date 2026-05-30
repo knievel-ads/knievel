@@ -40,8 +40,19 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 GRANT knievel_loader TO knievel_app;
 GRANT USAGE ON SCHEMA knievel TO knievel_loader;
 -- Tables/sequences are created later by auto_migrate (as knievel_app);
--- default privileges auto-grant the loader SELECT on each as it lands.
+-- default privileges auto-grant the loader these as each table lands.
+--
+-- SELECT covers the snapshot loader. INSERT/UPDATE cover the hourly
+-- rollup, which (also a `SET LOCAL ROLE knievel_loader` path)
+-- INSERT/UPDATEs `events_rollup` and UPDATEs `events_rollup_watermark`.
+-- Because init.sql runs before the tables exist, we grant via default
+-- privileges rather than per-table. This is broader than production —
+-- the loader only writes the two rollup tables there (see
+-- MIGRATION_RX.md "One-time provisioning") — but it's a dev-stack
+-- convenience: the capability is unused on every other table since the
+-- only roles that `SET ROLE knievel_loader` are the read-only snapshot
+-- loader and the rollup.
 ALTER DEFAULT PRIVILEGES FOR ROLE knievel_app IN SCHEMA knievel
-  GRANT SELECT ON TABLES TO knievel_loader;
+  GRANT SELECT, INSERT, UPDATE ON TABLES TO knievel_loader;
 ALTER DEFAULT PRIVILEGES FOR ROLE knievel_app IN SCHEMA knievel
   GRANT SELECT ON SEQUENCES TO knievel_loader;

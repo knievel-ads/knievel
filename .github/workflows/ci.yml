@@ -40,6 +40,9 @@ jobs:
       # is still complete, but keep them out of nextest discovery.
       - run: cargo nextest run --no-run --workspace --lib --bins --tests --examples --locked
       - run: cargo build --workspace --benches --locked
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
 
   unit-prop:
     name: unit + property
@@ -412,6 +415,22 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: '1.94'
+
+      # Inline equivalents of the rust-setup composite's sccache
+      # steps (same reason as above: composite path unavailable
+      # with the subdirectory checkout). Same pinned SHA + version.
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: "v0.15.0"
+
+      - name: Enable sccache (GHA backend) for cargo
+        run: |
+          {
+            echo "SCCACHE_GHA_ENABLED=true"
+            echo "RUSTC_WRAPPER=sccache"
+            echo "CARGO_INCREMENTAL=0"
+          } >> "$GITHUB_ENV"
 
       - uses: Swatinem/rust-cache@v2
         with:

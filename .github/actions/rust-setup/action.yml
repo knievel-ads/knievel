@@ -24,6 +24,25 @@ runs:
         toolchain: '1.94'
         components: ${{ inputs.components }}
 
+    - name: Install sccache
+      uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      with:
+        version: "v0.15.0"
+
+    - name: Enable sccache (GHA backend) for cargo
+      shell: bash
+      run: |
+        # SCCACHE_GHA_ENABLED routes sccache's store to the GitHub Actions
+        # cache (not ephemeral local disk). RUSTC_WRAPPER is set here in CI
+        # only — deliberately NOT in .cargo/config.toml, so coworkers' local
+        # builds are unaffected. CARGO_INCREMENTAL=0 because sccache cannot
+        # cache incremental builds and silently bypasses otherwise.
+        {
+          echo "SCCACHE_GHA_ENABLED=true"
+          echo "RUSTC_WRAPPER=sccache"
+          echo "CARGO_INCREMENTAL=0"
+        } >> "$GITHUB_ENV"
+
     - uses: Swatinem/rust-cache@v2
       with:
         shared-key: ${{ inputs.shared-key }}

@@ -5,9 +5,9 @@ follows [keep-a-changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows the additive-forever compatibility policy in
 `REQUIREMENTS.md` § 6.4.
 
-This file is generated from each release-tagging PR's "release
-notes" section. It is **not** hand-edited per commit; the
-authoritative per-commit log is `git log` plus `PHASES.md`.
+Release entries are maintained from immutable Git tags and commit
+history. `PHASES.md` is historical planning context, not current
+release provenance.
 
 ## [Unreleased]
 
@@ -22,6 +22,137 @@ authoritative per-commit log is `git log` plus `PHASES.md`.
 ### Fixed
 
 (none)
+
+## [0.1.37] — 2026-08-20
+
+### Changed
+
+- Aligned all workspace packages and OpenAPI metadata on version
+  `0.1.37`; the generated admin-UI client is unchanged because it does
+  not represent OpenAPI `info.version`.
+- Declared Rust 1.94 as the supported floor, enabled resolver 3, and
+  pinned the development toolchain to 1.97.1 while preserving the
+  Rust 1.94.1 compatibility check.
+- Centralized SQLx 0.8.6 feature selection and replaced its deprecated
+  combined Tokio/rustls alias with the equivalent explicit Tokio and
+  rustls ring/WebPKI features.
+- Refreshed the compatible lock graph for `anyhow`,
+  `astral-tokio-tar`, `crossbeam-epoch`, `event-listener`, `h2`,
+  `quinn-proto`, `spin`, and all three existing `rand` generations.
+
+### Security
+
+- Documented narrow audit exceptions for Poem's unused XML stack and
+  inactive SQLx MySQL RSA record. Benchmark-only `bincode` and
+  `proc-macro-error2` maintenance warnings remain visible.
+
+## [0.1.36] — 2026-05-30
+
+### Added
+
+- Populated per-pod decision snapshots with transaction-local reads
+  through a dedicated `BYPASSRLS` loader role.
+- Rendered Liquid templates at decision time and returned typed
+  creative payloads with correctly attributed creative IDs.
+
+### Fixed
+
+- Re-seeded missing taxonomy for projects orphaned by an interrupted
+  `seed-demo` run.
+- Made cross-tenant rollups use the loader role, tolerate null
+  dimensions, and clamp stale cold-start watermarks.
+
+## [0.1.35] — 2026-05-29
+
+### Added
+
+- Evaluated per-issuer JWT claim-mapping rules so Kubernetes service
+  account tokens without a `knievel` claim can map to principals.
+
+## [0.1.34] — 2026-05-10
+
+### Added
+
+- Added idempotent `knievel-cli admin create-org` production tenant
+  bootstrap without demo resources.
+
+## [0.1.33] — 2026-05-10
+
+### Changed
+
+- Removed redundant merge-to-main and image-build CI work already
+  covered by the protected pull-request gate.
+
+### Fixed
+
+- Probed for pre-provisioned PostgreSQL schemas and extensions before
+  privileged DDL so Aurora deployments can migrate with restricted
+  roles.
+
+## [0.1.32] — 2026-05-10
+
+### Added
+
+- Added structured per-request logs, request IDs, slow-request
+  reporting, and visible JWT/JWKS rejection reasons.
+
+### Changed
+
+- Made database startup retry with bounded backoff, report complete
+  error chains and operator hints, and fail fast when required setup
+  cannot complete.
+
+## [0.1.31] — 2026-05-09
+
+### Added
+
+- Wired JWT bearer authentication to OIDC discovery and cached JWKS
+  signature verification.
+- Added a testcontainer Keycloak round trip with invalid-signature and
+  unrelated-key rejection cases.
+
+## [0.1.30] — 2026-05-09
+
+### Fixed
+
+- Pointed OIDC callback and post-logout redirects at the `/admin/`
+  mount.
+
+## [0.1.29] — 2026-05-09
+
+### Fixed
+
+- Preserved the serialized admin route in authentication `return_to`
+  values by using TanStack Router's `location.href`.
+
+## [0.1.28] — 2026-05-09
+
+### Fixed
+
+- Shared Docker registry credentials between Helm and Cosign so
+  published OCI charts can be signed.
+
+## [0.1.27] — 2026-05-08
+
+### Added
+
+- Published versioned, keyless-signed Helm OCI charts to GHCR after
+  the matching image is available.
+
+## [0.1.26] — 2026-05-08
+
+### Added
+
+- Exposed admin-UI OIDC issuer, client, scopes, and enforcement values
+  through the Helm chart.
+
+## [0.1.25] — 2026-05-08
+
+### Changed
+
+- Trusted the protected pull-request gate for releases and moved
+  multi-architecture image builds from QEMU to native runners while
+  retaining one canonical Dockerfile build path.
 
 ## [0.1.24] — 2026-05-08
 
@@ -380,9 +511,22 @@ authoritative per-commit log is `git log` plus `PHASES.md`.
 Squatted `knievel` on RubyGems. No public release; first real
 release was `0.1.1`.
 
-[Unreleased]: https://github.com/knievel-ads/knievel/compare/v0.1.24...HEAD
+[Unreleased]: https://github.com/knievel-ads/knievel/compare/v0.1.37...HEAD
+[0.1.37]: https://github.com/knievel-ads/knievel/compare/v0.1.36...v0.1.37
+[0.1.36]: https://github.com/knievel-ads/knievel/compare/v0.1.35...v0.1.36
+[0.1.35]: https://github.com/knievel-ads/knievel/compare/v0.1.34...v0.1.35
+[0.1.34]: https://github.com/knievel-ads/knievel/compare/v0.1.33...v0.1.34
+[0.1.33]: https://github.com/knievel-ads/knievel/compare/v0.1.32...v0.1.33
+[0.1.32]: https://github.com/knievel-ads/knievel/compare/v0.1.31...v0.1.32
+[0.1.31]: https://github.com/knievel-ads/knievel/compare/v0.1.30...v0.1.31
+[0.1.30]: https://github.com/knievel-ads/knievel/compare/v0.1.29...v0.1.30
+[0.1.29]: https://github.com/knievel-ads/knievel/compare/v0.1.28...v0.1.29
+[0.1.28]: https://github.com/knievel-ads/knievel/compare/v0.1.27...v0.1.28
+[0.1.27]: https://github.com/knievel-ads/knievel/compare/v0.1.26...v0.1.27
+[0.1.26]: https://github.com/knievel-ads/knievel/compare/v0.1.25...v0.1.26
+[0.1.25]: https://github.com/knievel-ads/knievel/compare/v0.1.24...v0.1.25
 [0.1.24]: https://github.com/knievel-ads/knievel/compare/v0.1.23...v0.1.24
-[0.1.23]: https://github.com/knievel-ads/knievel/compare/v0.1.16...v0.1.23
+[0.1.23]: https://github.com/knievel-ads/knievel/compare/v0.1.22...v0.1.23
 [0.1.22]: https://github.com/knievel-ads/knievel/compare/v0.1.21...v0.1.22
 [0.1.21]: https://github.com/knievel-ads/knievel/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/knievel-ads/knievel/compare/v0.1.19...v0.1.20

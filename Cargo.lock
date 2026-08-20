@@ -1714,7 +1714,7 @@ dependencies = [
 
 [[package]]
 name = "knievel"
-version = "0.1.31"
+version = "0.1.37"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3656,7 +3656,7 @@ dependencies = [
 
 [[package]]
 name = "testlib"
-version = "0.1.31"
+version = "0.1.37"
 dependencies = [
  "anyhow",
  "sqlx",
@@ -4794,7 +4794,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.31"
+version = "0.1.37"
 dependencies = [
  "anyhow",
  "clap",

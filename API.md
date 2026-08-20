@@ -1,1035 +1,361 @@
-# Knievel API
+# Knievel HTTP API
 
-Implementation reference for the v0 HTTP surface. Companion to
-`REQUIREMENTS.md`. The OpenAPI spec generated from the Rust binary is the
-source of truth; this document is the human map.
+The Rust `#[oai]` declarations generate [`openapi.yaml`](openapi.yaml), which is
+the machine-readable contract. This document supplies the human operation map
+and current implementation caveats. JSON properties and query parameters are
+`snake_case`.
 
-JSON only. UTF-8 only.
+## Canonical generated operations
 
-## Path Structure
+The table between the markers is the **only** canonical operation table.
+`cargo xtask check-api-doc` compares normalized `(HTTP method, path)` pairs in
+both directions against generated OpenAPI. Parameter spelling inside braces is
+normalized; methods are not.
 
-- `/v1/orgs/{org_id}/...` — org-level operations (project provisioning,
-  tokens, members). Org token only.
-- `/v1/projects/{project_id}/...` — project-scoped resources (decisions,
-  CRUD).
-- `/e/...` — public event tracking (HMAC-signed in URL, no auth).
-- `/openapi.json`, `/healthz`, `/readyz`, `/metrics`, `/version` — system.
+<!-- BEGIN CANONICAL OPENAPI OPERATIONS -->
+| Verb | Path | Purpose |
+|---|---|---|
+| `GET` | `/healthz` | Process liveness. |
+| `GET` | `/readyz` | Database reachability readiness. |
+| `GET` | `/version` | Build metadata and effective auth policy. |
+| `GET` | `/v1/whoami` | Validate a bearer and return its principal. |
+| `POST` | `/v1/orgs/{org_id}/projects` | Create a project and default taxonomy. |
+| `GET` | `/v1/orgs/{org_id}/projects` | List projects in the organization. |
+| `GET` | `/v1/orgs/{org_id}/projects/{project_id}` | Read one project. |
+| `GET` | `/v1/orgs/{org_id}` | Read organization metadata. |
+| `POST` | `/v1/orgs/{org_id}/tokens` | Mint an opaque token. |
+| `GET` | `/v1/orgs/{org_id}/tokens` | List token metadata. |
+| `DELETE` | `/v1/orgs/{org_id}/tokens/{token_id}` | Revoke a live token. |
+| `POST` | `/v1/orgs/{org_id}/ad-library/items` | Create an organization ad-library item. |
+| `GET` | `/v1/orgs/{org_id}/ad-library/items` | List organization ad-library items. |
+| `GET` | `/v1/orgs/{org_id}/ad-library/items/{item_id}` | Read one ad-library item. |
+| `PATCH` | `/v1/orgs/{org_id}/ad-library/items/{item_id}` | Update one ad-library item. |
+| `POST` | `/v1/projects/{project_id}/advertisers` | Create an advertiser. |
+| `GET` | `/v1/projects/{project_id}/advertisers` | List advertisers. |
+| `GET` | `/v1/projects/{project_id}/advertisers/{id}` | Read an advertiser. |
+| `PATCH` | `/v1/projects/{project_id}/advertisers/{id}` | Update an advertiser. |
+| `POST` | `/v1/projects/{project_id}/advertisers:batchUpsert` | Batch upsert advertisers by external ID. |
+| `POST` | `/v1/projects/{project_id}/campaigns` | Create a campaign. |
+| `GET` | `/v1/projects/{project_id}/campaigns` | List campaigns. |
+| `GET` | `/v1/projects/{project_id}/campaigns/{id}` | Read a campaign. |
+| `PATCH` | `/v1/projects/{project_id}/campaigns/{id}` | Update a campaign. |
+| `POST` | `/v1/projects/{project_id}/campaigns:batchUpsert` | Batch upsert campaigns by external ID. |
+| `POST` | `/v1/projects/{project_id}/flights` | Create a flight. |
+| `GET` | `/v1/projects/{project_id}/flights` | List flights. |
+| `GET` | `/v1/projects/{project_id}/flights/{id}` | Read a flight. |
+| `PATCH` | `/v1/projects/{project_id}/flights/{id}` | Update a flight. |
+| `POST` | `/v1/projects/{project_id}/flights:batchUpsert` | Batch upsert flights by external ID. |
+| `POST` | `/v1/projects/{project_id}/creatives` | Create a creative. |
+| `GET` | `/v1/projects/{project_id}/creatives` | List creatives. |
+| `POST` | `/v1/projects/{project_id}/creatives/{id}/image` | Validate and upload creative image bytes. |
+| `GET` | `/v1/projects/{project_id}/creatives/{id}` | Read a creative. |
+| `POST` | `/v1/projects/{project_id}/creative-templates` | Create a creative template. |
+| `GET` | `/v1/projects/{project_id}/creative-templates` | List creative templates. |
+| `GET` | `/v1/projects/{project_id}/creative-templates/{id}` | Read a creative template. |
+| `PATCH` | `/v1/projects/{project_id}/creative-templates/{id}` | Update and version a creative template. |
+| `POST` | `/v1/projects/{project_id}/ads` | Create a flight-to-creative ad binding. |
+| `GET` | `/v1/projects/{project_id}/ads` | List ads. |
+| `GET` | `/v1/projects/{project_id}/ads/{id}` | Read an ad. |
+| `PATCH` | `/v1/projects/{project_id}/ads/{id}` | Update an ad. |
+| `POST` | `/v1/projects/{project_id}/ads:batchUpsert` | Batch upsert ads by external ID. |
+| `POST` | `/v1/projects/{project_id}/sites` | Create a site. |
+| `GET` | `/v1/projects/{project_id}/sites` | List sites. |
+| `POST` | `/v1/projects/{project_id}/sites/upsert-by-url` | Find or create a site by canonical URL. |
+| `GET` | `/v1/projects/{project_id}/sites/{id}` | Read a site. |
+| `PATCH` | `/v1/projects/{project_id}/sites/{id}` | Update a site. |
+| `POST` | `/v1/projects/{project_id}/sites:batchUpsert` | Batch upsert sites by external ID. |
+| `POST` | `/v1/projects/{project_id}/zones` | Create a zone. |
+| `GET` | `/v1/projects/{project_id}/zones` | List zones. |
+| `GET` | `/v1/projects/{project_id}/zones/{id}` | Read a zone. |
+| `PATCH` | `/v1/projects/{project_id}/zones/{id}` | Update a zone. |
+| `POST` | `/v1/projects/{project_id}/zones:batchUpsert` | Batch upsert zones by external ID. |
+| `GET` | `/v1/projects/{project_id}/channels` | List project channels. |
+| `GET` | `/v1/projects/{project_id}/channels/{id}` | Read a channel. |
+| `GET` | `/v1/projects/{project_id}/priorities` | List priorities in tier order. |
+| `GET` | `/v1/projects/{project_id}/priorities/{id}` | Read a priority. |
+| `GET` | `/v1/projects/{project_id}/ad-types` | List project ad types. |
+| `GET` | `/v1/projects/{project_id}/ad-types/{id}` | Read an ad type. |
+| `POST` | `/v1/projects/{project_id}/decisions` | Select ads and enqueue decision events. |
+| `POST` | `/v1/projects/{project_id}/decisions:explain` | Explain selection without enqueueing events. |
+<!-- END CANONICAL OPENAPI OPERATIONS -->
 
-`{org_id}` and `{project_id}` accept either the server-assigned ID
-(`org_AbCd...`, `pj_EfGh...`) or the URL-safe `external_id`.
+## Direct routes outside OpenAPI
 
-## Conventions
+These routes are mounted directly in [`src/server.rs`](src/server.rs) and are
+not part of the 62-operation generated table:
+
+| Verb | Path | Current behavior |
+|---|---|---|
+| `GET` | `/openapi.json` | Live JSON OpenAPI document from the same service tuple. |
+| `GET` | `/admin/config.json` | Public OIDC client metadata for the SPA; no secret. |
+| `GET` | `/e/i/{signed}` | HMAC-authorized impression response and best-effort event enqueue. |
+| `GET` | `/e/c/{signed}` | HMAC-authorized click event and redirect. |
+| `GET` | `/admin/*` | Static SPA and history fallback when a static directory is configured. |
+
+There is no `/metrics` route.
+
+## Common wire behavior
 
 ### Authentication
 
-- **Management + Decision endpoints:** `Authorization: Bearer <credential>`.
-  Two coexisting credential types are accepted (per-deployment config
-  picks which are enabled):
-  - **Opaque tokens** — prefix `kvl_<env>_<scope>_<random>`. DB
-    lookup. Org-scoped tokens may address any Project in their Org;
-    Project-scoped tokens are limited to their own Project.
-  - **JWTs** — standard three-segment JWT. Validated statelessly
-    against the issuer's JWKS (Keycloak or any OIDC provider).
-    Authorization context is read from a `knievel` claim (`scope`,
-    `org_id`, `project_id`, `role`). See `AUTH.md`.
-  - Wrong org or project for the credential → `403`.
-- **Event endpoints (`/e/...`)**: unauthenticated. Browsers hit them
-  directly. Authorization is the HMAC signature in the URL.
-- **System endpoints**: unauthenticated by default; operator can put them
-  behind a reverse proxy.
+Generated management and decision operations require
+`Authorization: Bearer <credential>` except the three generated system routes
+(`/healthz`, `/readyz`, `/version`). `/v1/whoami` is the smallest authenticated
+handshake.
 
-### Headers
+Opaque credentials are DB-backed and always available with a DB. JWT-shaped
+credentials are accepted when at least one `auth.jwt.issuers` policy is
+configured. Scope, role, actual activation, and browser storage are documented
+in [AUTH.md](AUTH.md).
 
-| Header | Used on | Purpose |
-|---|---|---|
-| `Authorization` | management, decision | `Bearer <token>` |
-| `Idempotency-Key` | all `POST`/`PATCH` | Replay-safe within 24 h |
-| `Content-Type` | writes | `application/json` (or `multipart/form-data` for image upload) |
-| `If-Match` | `PATCH` (optional) | Optimistic concurrency on `etag` |
-| `Accept` | any | `application/json` |
+### IDs and names
 
-### Pagination
-
-Cursor-based:
-
-```
-GET /v1/projects/{project_id}/<resource>?limit=100&cursor=<opaque>
-```
-
-Response envelope:
-
-```json,ignore
-{
-  "items": [ ... ],
-  "next_cursor": "eyJ..." | null
-}
-```
-
-`limit` defaults to 50, max 500 (`limit=0` and `limit > 500` are
-rejected with `400 invalid_limit`). No `total_records` — counting
-is expensive and rarely useful at this layer.
-
-Cursors are opaque (`base64url(JSON{kind, last_id})` internally,
-but consumers should treat them as black boxes). The server
-rejects a cursor whose `kind` doesn't match the endpoint that
-received it (`400 invalid_cursor`) — this catches the
-"`listAdvertisers` cursor pasted into `listCampaigns`" footgun
-without requiring HMAC-signed cursors.
-
-The cursor only carries the resume key — **changing filters
-between pages is the caller's responsibility**. A cursor minted
-under one filter set, replayed against a different filter set on
-the same endpoint, may skip rows or return duplicates relative
-to a fresh-walk-with-the-new-filter. Consumers walking with
-filters should keep the filter set stable across the walk.
-
-**Non-paginated list endpoints (v0):** taxonomy
-(`listChannels`, `listPriorities`, `listAdTypes`) return the
-full set in semantic order (priorities by `tier`); the response
-shape still carries `next_cursor` (always `null`) so wrappers
-degenerate to a single-page walk. `listAdLibraryItems` and
-`listTokens` are also un-cursored in v0 because their primary
-keys are TEXT (`(created_at, id)` cursor lands in Phase 6.5).
-
-**Future:** generated client wrappers (e.g. the Ruby gem in
-`REQUIREMENTS.md` §8 item 3) eventually key off
-`x-knievel-paginated: true` /
-`x-knievel-paginated-items: items` /
-`x-knievel-paginated-cursor: next_cursor` vendor extensions on
-each paginated operation, so a second-language binding or a
-doc-site generator can discover paginated endpoints from the
-spec alone. **Not shipped today** — poem-openapi 5 lacks an
-operation-level extension API, and we're upstreaming it first
-rather than carrying a post-processor in `cargo xtask openapi`.
-Tracked in PHASES.md § 6.6. Until then, the Ruby gem's
-hand-written wrapper hardcodes its paginated set.
-
-### Filters
-
-Every list endpoint accepts `external_id=` plus resource-specific filters.
-Filters AND together. Examples:
-
-```
-GET /v1/projects/pj_AbCd/ads?flight_id=42&is_active=true
-GET /v1/projects/pj_AbCd/ads?external_id=ad-2024-spring-1
-```
-
-### Idempotency
-
-`POST` and `PATCH` accept `Idempotency-Key`. Responses are stored 24 h
-keyed on `(project, key, route, body-hash)`. Replays return the original
-response with `Idempotent-Replay: true` set.
-
-### Status codes
-
-| Code | Meaning |
-|---|---|
-| `200` | OK (read, update, idempotent replay) |
-| `201` | Created |
-| `202` | Accepted (async work queued) |
-| `204` | No content (impression ping, delete) |
-| `302` | Redirect (click ping) |
-| `400` | Malformed request |
-| `401` | Missing / invalid token |
-| `403` | Wrong org/project or insufficient role |
-| `404` | Not found |
-| `409` | Conflict (`external_id` collision, `If-Match` mismatch) |
-| `422` | Semantically invalid (e.g. campaign references missing advertiser) |
-| `429` | Rate limited |
-| `500` | Server error |
-| `503` | Event channel saturated; retry with backoff |
+- Organization and project IDs are text such as `org_...` and `pj_...`.
+- Most project resource IDs are signed 64-bit integers in JSON.
+- `external_id` is caller-defined where exposed; it is not universally accepted
+  in path parameters.
+- Wire properties and query parameters are `snake_case`; operation IDs remain
+  OpenAPI-style camelCase identifiers.
 
 ### Error body
 
-```json
-{
-  "error": {
-    "code": "validation_failed",
-    "message": "site_id is required",
-    "field": "placements[0].site_id",
-    "request_id": "01JABCDEF..."
-  }
-}
-```
-
-`code` is a stable machine-readable string. `request_id` matches the
-`X-Request-Id` response header and server logs.
-
-### Write contract
-
-Every mutation — single `POST` / `PATCH` and any `:batchUpsert` —
-runs in **exactly one Postgres transaction**. There are three rules:
-
-1. **All-or-nothing per call.** If any row in a `:batchUpsert` (or
-   any cross-entity FK in a single-row write) fails validation, the
-   entire transaction rolls back. Partial state never leaks into the
-   snapshot. There are no "best-effort" semantics on any wire
-   endpoint; the gem-side `upsertWithFlightAndCreative` helper is
-   self-healing across multiple wire calls, but each individual wire
-   call is atomic.
-2. **Cross-entity FKs validated inside the transaction.** Creating
-   a flight that references a campaign, an ad referencing a
-   creative, a creative referencing a CreativeTemplate — every
-   reference is verified against the same transaction's view, so a
-   campaign created earlier in the same `:batchUpsert` is visible to
-   a flight defined later in the array. This means callers can ship
-   a logically coherent unit (advertiser → campaign → flight → ad
-   → creative) in one batch.
-3. **Per-row diagnostics.** When a batch fails, the error body lists
-   each offending row with deterministic structure:
+Typed handler errors use exactly `code` and `message` inside `error`:
 
 ```json
 {
   "error": {
-    "code": "batch_partial_failure",
-    "message": "1 of 12 rows failed validation",
-    "request_id": "01JABCDEF...",
-    "details": [
-      {
-        "index":   3,
-        "field":   "campaign_id",
-        "code":    "fk_not_found",
-        "message": "campaign_id 12345 does not exist in this project"
-      }
-    ]
+    "code": "invalid_limit",
+    "message": "limit must be <= 500"
   }
 }
 ```
 
-`details[].index` is the position in the request array.
-`details[].code` is one of: `fk_not_found`, `external_id_conflict`,
-`validation_failed`, `unique_violation`, `if_match_mismatch`. The
-absence of a row in `details[]` means it would have committed
-successfully; idempotent retries can skip already-applied rows by
-omitting them from the next request, since `external_id` upserts are
-already idempotent.
+`field`, `request_id`, `details`, RFC 9457 fields, and a
+`problem+json` content type are not a universal shipped error contract. The
+`x-request-id` response header is added by request-logging middleware, but it is
+not inserted into `ErrorBody`.
 
-### Common entity fields
+Framework-level extraction/auth failures can have a framework response shape;
+consult the generated response schemas and test the operation you consume.
 
-| Field | Type | Notes |
-|---|---|---|
-| `id` | string | Server-assigned, project-scoped (or org-scoped for orgs/projects). |
-| `external_id` | string \| null | Caller-assigned, unique within `(project, resource)`. |
-| `etag` | string | Pass to `If-Match` on `PATCH`. |
-| `created_at` | RFC 3339 | |
-| `updated_at` | RFC 3339 | |
-| `is_active` | bool | Soft-delete via `is_active: false`; v0 has no hard delete. |
+### Pagination
 
----
+Advertisers, campaigns, flights, creatives, creative templates, ads, sites, and
+zones use bigserial cursor pagination:
 
-## 1. Decision API
+```text
+?limit=50&cursor=<base64url-json>
+```
 
-### `POST /v1/projects/{project_id}/decisions`
+- default limit: 50;
+- maximum: 500;
+- order: `id DESC`;
+- cursor payload: resource kind plus last ID; and
+- a cursor from another resource returns `invalid_cursor`.
 
-The hot path. Returns ad selections for one or more placements.
+Taxonomy lists are bounded and return their full set. Project, token, and
+ad-library list envelopes currently return `next_cursor: null` and have their
+own safety caps. Keep filters stable between pages because the cursor does not
+bind filter state.
 
-**Request:**
+### Mutations and idempotency
+
+Do not assume every POST/PATCH implements a global write contract. Behavior is
+per handler and represented in its generated responses:
+
+- project creation accepts `Idempotency-Key` and has a replay cache path;
+- batch-upsert handlers use one outer transaction and roll it back on a row
+  failure, but the current resource loops generally stop at the first SQL error;
+  they do not guarantee exhaustive per-row diagnostics (the shared savepoint
+  helper is not wired into these handlers);
+- resource create handlers generally return conflicts for duplicate external
+  IDs rather than treating POST as a universal upsert; and
+- PATCH support exists only where listed in the canonical table.
+
+Use `:batchUpsert` only for resources with a generated operation. There is no
+single batch endpoint spanning advertiser → campaign → flight → creative → ad.
+
+### ETags
+
+Responses expose `etag` on mutable resources. PATCH handlers that accept
+`If-Match` call the shared checker where wired; generated parameters are the
+operation-level authority. Do not infer PATCH support from an entity having an
+etag.
+
+## Decision API
+
+### Request
+
+A minimal request uses one real site ID and one ad-type ID:
 
 ```json
 {
-  "context": {
-    "url":       "https://example.com/article/42",
-    "referrer":  "https://www.google.com/...",
-    "user_agent": "Mozilla/5.0 ..."
-  },
   "placements": [
     {
-      "id":            "header",
-      "site_id":        12,
-      "site_url":       null,
-      "site_external_id": null,
-      "zone_ids":       [34, 35],
-      "ad_types":       [16],
-      "count":         1,
-      "force": {
-        "ad_id":        null,
-        "campaign_id":  null,
-        "flight_id":    null,
-        "creative_id":  null
-      }
+      "id": "header",
+      "site_id": 12,
+      "ad_types": [16]
     }
-  ],
-  "block": {
-    "creative_ids":   [],
-    "advertiser_ids": [],
-    "campaign_ids":   []
-  }
+  ]
 }
 ```
 
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `context.url` | string | no | Page URL serving the ad. Stored on event rows. |
-| `context.referrer` | string | no | Referrer URL. |
-| `context.user_agent` | string | no | UA string; hashed before storage. |
-| `placements[]` | array | yes | 1–32 placements per request. |
-| `placements[].id` | string | yes | Echoed as the response key. |
-| `placements[].site_id` \| `site_url` \| `site_external_id` | — | yes (one) | Identifies the site. URL match consults `Site.url` and `Site.aliases`. |
-| `placements[].zone_ids` | int64[] | no | Restrict to specific zones. |
-| `placements[].ad_types` | int[] | yes | Non-empty. |
-| `placements[].count` | int | no | Default 1, max 10. |
-| `placements[].force.*` | int64 \| null | no | Debug overrides. Three-control gate: (1) project's `allow_force_decision` flag must be true; (2) Project Admin role or higher; (3) call is recorded in `knievel.audit_log` with actor, payload hash, and reason (passed via optional top-level `force_reason` string). Knievel rejects with `403 / force_disabled` if any control fails. A global kill-switch (`decisions.force_overrides_enabled: false`) disables the path entirely. |
-| `block.creative_ids` | int64[] | no | Caller-derived suppression list. |
-| `block.advertiser_ids` | int64[] | no | |
-| `block.campaign_ids` | int64[] | no | |
+The generated `DecisionsRequest` fields are:
 
-`context` is informational only — it is **never** used for tenant
-routing. The project ID in the path is the sole authoritative tenant
-signal.
+- optional `context` (`url`, `referrer`, `user_agent`);
+- `placements` (1–32);
+- optional `block` (`creative_ids`, `advertiser_ids`, `campaign_ids`); and
+- optional `force_reason`.
 
-**Response (200):**
+A placement carries `id`, one of the currently useful site locators,
+`zone_ids`, required non-empty `ad_types`, optional `count`, and optional
+`force`. Current resolution supports numeric `site_id` and exact
+`site_url`/alias. `site_external_id` is accepted by the schema but not present
+in the snapshot and therefore yields no fill. `count` defaults to one and is
+clamped to the range 1–10 rather than rejected above the maximum.
+
+### Selection and response
+
+The handler authenticates at reader level, proves project tenancy, then uses one
+snapshot version for all placements. It filters active flights/ads, targeting,
+and blocklists; keeps the lowest numeric priority tier; and performs weighted
+selection without replacement.
+
+A successful response has:
 
 ```json
 {
-  "snapshot_version": 1234567,
+  "snapshot_version": 42,
   "decisions": {
     "header": [
       {
-        "ad_id":         9001,
-        "creative_id":   4242,
-        "flight_id":     333,
-        "campaign_id":   444,
-        "advertiser_id": 555,
-        "priority_id":   1,
-        "site_id":       12,
-        "external_id":   "ad-2024-spring-1",
-        "click_url":     "https://ads.example.com/e/c/AbCd...",
-        "impression_url":"https://ads.example.com/e/i/EfGh...",
-        "creative": {
-          "type":     "native",
-          "template": "sponsored_card_v1",
-          "values": {
-            "title":   "...",
-            "body":    "...",
-            "image_url":"...",
-            "cta_text": "Learn more"
-          }
-        }
+        "ad_id": 1,
+        "creative_id": 1,
+        "flight_id": 1,
+        "campaign_id": 1,
+        "advertiser_id": 1,
+        "priority_id": 2,
+        "site_id": 12,
+        "click_url": "/e/c/<signed>",
+        "impression_url": "/e/i/<signed>",
+        "creative": null
       }
     ]
   }
 }
 ```
 
-- `snapshot_version` is the monotonic configuration version that
-  served this request. Stamped on the corresponding `events_raw`
-  rows and emitted on per-request log lines so an operator can
-  reproduce a decision deterministically: same input + same
-  `snapshot_version` → same output.
-- `decisions[<id>]` is **always an array**, even when `count == 1`.
-  Empty array = no eligible ad.
-- `site_id` is the resolved site (useful when caller passed `site_url` or
-  `site_external_id`).
-- `creative` is a `oneOf`:
-  - `{"type":"image","image_url":..,"width":..,"height":..,"alt":..,"click_through_url":..}`
-  - `{"type":"html","body":..,"click_through_url":..}` — `body` is the
-    static HTML stored on the creative, returned verbatim.
-  - `{"type":"native","template":..,"values":{...},"click_through_url":..}`
-    — caller renders `values` client-side using its own components.
-  - `{"type":"templated","template":..,"values":{...},"body":..,"click_through_url":..}`
-    — server renders the referenced template's Liquid source against
-    `values` at decision time and returns the result in `body`.
-    `values` is also echoed so callers can re-render or inspect.
-- All URL fields are absolute.
+`decisions[placement_id]` is always an array; no eligible ad is an empty array.
+The creative is a generated discriminated union for `image`, `html`, `native`,
+or `templated`, and can be null. Templated creatives render Liquid from the
+snapshot at decision time; a render failure skips that ad.
 
-### `POST /v1/projects/{project_id}/decisions:explain`
+Tracking URLs are currently relative. `api.public_base_url` is parsed but not
+used by `decide_pure` or its handler.
 
-A debug companion to `decisions`. Accepts the **same request body**
-and returns the same `decisions` payload, plus a per-placement
-`explanation` array showing every candidate ad and the rules that
-were applied to it. No event is recorded; no impression / click URL
-is minted (the URLs returned are dummy placeholders, marked as such).
+### Force overrides
 
-Same auth as `decisions` (any role with read access to the project).
-Rate-limited more aggressively than production decisions (default
-60 req/min per token).
+Any placement carrying `force` activates a four-part gate:
 
-**Response (200):**
+1. global `decisions.force_overrides_enabled`;
+2. project `allow_force_decision` in the loaded snapshot;
+3. `admin` role or higher; and
+4. an audit insert/commit before selection.
 
-```json,ignore
-{
-  "snapshot_version": 1234567,
-  "decisions":       { "header": [ ...same shape as /decisions... ] },
-  "explanation": {
-    "header": {
-      "priority_tier":  1,
-      "selected_ad_id":  9001,
-      "candidates": [
-        {
-          "ad_id":         9001,
-          "creative_id":   4242,
-          "flight_id":     333,
-          "campaign_id":   444,
-          "advertiser_id": 555,
-          "weight":       100,
-          "evaluation": [
-            { "rule": "flight_active",      "result": "pass" },
-            { "rule": "site_match",         "result": "pass" },
-            { "rule": "ad_type_match",      "result": "pass" },
-            { "rule": "block_creative_ids", "result": "pass" },
-            { "rule": "weighted_random",    "result": "selected" }
-          ]
-        },
-        {
-          "ad_id":         9002,
-          "creative_id":   4243,
-          "flight_id":     333,
-          "campaign_id":   444,
-          "advertiser_id": 555,
-          "weight":       100,
-          "evaluation": [
-            { "rule": "flight_active", "result": "pass" },
-            { "rule": "site_match",    "result": "fail",
-              "detail": "site_id 12 not in flight.site_ids [99]" }
-          ]
-        }
-      ]
-    }
-  }
-}
-```
+A failed control returns `force_disabled`. The implemented selector currently
+applies `force.ad_id`; the other force fields are present in the request shape
+but are not used to choose a candidate.
 
-`evaluation` entries appear in evaluation order; `result` is one of
-`pass`, `fail`, `selected`, `not_selected`. `detail` is populated on
-fails and on rules that produced random outcomes. The shape is meant
-to be diff-friendly between two requests so traffickers can spot
-"what changed."
+### Snapshot freshness
 
----
+Every pod cold-loads, then checks the `config_version` sequence on a fixed
+five-second interval. Management writes do not bump the sequence and no
+LISTEN/NOTIFY path is active. A write is not guaranteed to appear in decisions
+until an external bump or process restart. `snapshot_cold` is a 503 while the
+project is absent from the loaded map.
 
-## 2. Org Operations
+### Event enqueue
 
-All endpoints in this section require an **Org token** (Org Owner / Org
-Admin).
+Each selected ad composes one kind-0 decision event. The bounded sender is
+non-blocking; saturation or a dead flusher returns 503. The flusher performs
+per-row INSERTs, not COPY. See [REPORTING.md](REPORTING.md).
 
-### 2.1 Projects
+### Explainer
 
-| Verb | Path | Purpose |
+`decisions:explain` accepts the same request shape and returns selections plus
+candidate/rule explanations. It does not enqueue an event or write the force
+audit row. Its tracking values are placeholders rather than usable signed URLs.
+
+## Creative image upload
+
+The upload operation validates a maximum 40 MiB body and magic bytes for JPEG,
+PNG, GIF, WebP, or AVIF; SVG is not accepted. The server always installs
+`InMemoryStore`, so the returned `image_url` uses `memory://...`, data disappears
+on restart, and replicas do not share it. This is suitable for tests and local
+experimentation, not durable asset hosting.
+
+## Event tracking direct routes
+
+### Impression
+
+`GET /e/i/{signed}` returns 204 whether verification succeeds or fails. With
+`?fmt=gif`, it returns a 43-byte transparent GIF with 200. A verified hit
+attempts to enqueue kind 1; channel failure is logged/dropped and does not change
+the HTTP result.
+
+### Click
+
+`GET /e/c/{signed}` returns 400 for an invalid signature. A verified hit attempts
+to enqueue kind 2 and redirects with 302 to the snapshot's click-through URL,
+or `/` when none is found. The `u` query parameter is parsed but ignored because
+no override target is present in the signed payload.
+
+### Signature and dedup limitations
+
+The compact payload contains project, ad, creative, placement hash, issue time,
+and nonce. The current signer uses the same blob for click and impression; the
+route path selects the recorded kind. The verifier's `kind` argument does not
+bind the signature to one route.
+
+Ping events derive a stable dedup key, but the database uniqueness constraint is
+`(project_id, kind, dedup_key, ts)`. Replays at different timestamps do not
+conflict. Read [REPORTING.md](REPORTING.md) before using `is_duplicate` for
+billing or fraud controls.
+
+The schema has previous-secret rotation columns, but the snapshot loader does
+not load them and sets the previous secret to null. An eight-hour overlap is not
+active behavior.
+
+## System and admin routes
+
+- `/healthz`: always `200` with `ok` while the process serves.
+- `/readyz`: DB `SELECT 1`; explicit DB-less mode also returns 200. It does not
+  check snapshot/event/leader health.
+- `/version`: package/schema/build fields and effective opaque/JWT summary.
+- `/openapi.json`: live generated spec.
+- `/admin/config.json`: public OIDC issuer/client/scopes/require flag.
+- `/admin/*`: optional static SPA. Both OIDC and paste-token flows use browser
+  `sessionStorage`; see [SECURITY.md](SECURITY.md).
+
+## Design-only operations not shipped
+
+These nine operations appeared in older requirements or phase-era API tables.
+They are intentionally outside the canonical table and have no generated
+handler:
+
+| Verb | Path | Classification |
 |---|---|---|
-| `GET` | `/v1/orgs/{org_id}` | Read org metadata (id, external_id, name, is_active, etag, created_at, updated_at). Powers the admin SPA's org-dashboard breadcrumbs (`UI.md` "Information architecture"). Min role: `reader`. |
-| `GET` | `/v1/orgs/{org_id}/projects` | List. Filter: `external_id`, `is_active`. Cursor envelope wired (Phase 7.5); `next_cursor` is `null` today — TEXT-id cursor pagination is deferred to Phase 6.5. |
-| `POST` | `/v1/orgs/{org_id}/projects` | Create. Idempotent on `external_id`. |
-| `POST` | `/v1/orgs/{org_id}/projects:batchUpsert` | Bulk by `external_id`. |
-| `GET` | `/v1/orgs/{org_id}/projects/{project_id}` | Read. |
-| `PATCH` | `/v1/orgs/{org_id}/projects/{project_id}` | Update name / is_active / hmacSecret. |
-
-Body:
-
-```json
-{
-  "external_id": "tenant_acme",
-  "name":       "Acme Marketplace"
-}
-```
-
-### 2.2 Tokens
-
-| Verb | Path | Purpose |
-|---|---|---|
-| `POST` | `/v1/orgs/{org_id}/tokens` | Mint a token. Returns the secret exactly once. |
-| `GET` | `/v1/orgs/{org_id}/tokens` | List token metadata (no secrets). |
-| `DELETE` | `/v1/orgs/{org_id}/tokens/{token_id}` | Revoke. |
-
-Create body:
-
-```json
-{
-  "name":        "prod sync",
-  "scope":       "org",
-  "project_id":   null,
-  "role":        "editor",
-  "expires_at":   null,
-  "ip_allowlist": []
-}
-```
-
-| Field | Required | Notes |
-|---|---|---|
-| `scope` | yes | `org` or `project`. |
-| `project_id` | if `scope=project` | |
-| `role` | yes | `org-owner`, `org-admin`, `admin`, `editor`, `reader`. Org tokens take an org-level role; project tokens take a project-level role. |
-| `expires_at` | no | RFC 3339. Null = never. |
-| `ip_allowlist` | no | CIDR list. Empty = no restriction. |
-
-Create response (`201`):
-
-```json
-{
-  "id":        "tok_AbCd...",
-  "secret":    "kvl_prod_org_AbCd_8f2a...",
-  "name":      "prod sync",
-  "scope":     "org",
-  "role":      "editor",
-  "created_at": "..."
-}
-```
-
-`secret` is returned **only once**. Lost secrets cannot be recovered;
-revoke and reissue.
-
-### 2.3 Members
-
-User management is mostly stub for v0 (no admin UI), but the endpoints
-exist so the data model and auth checks are in place.
-
-| Verb | Path | Purpose |
-|---|---|---|
-| `GET` | `/v1/orgs/{org_id}/members` | List org members. |
-| `POST` | `/v1/orgs/{org_id}/members` | Invite a user. |
-| `PATCH` | `/v1/orgs/{org_id}/members/{user_id}` | Change org role or per-project roles. |
-| `DELETE` | `/v1/orgs/{org_id}/members/{user_id}` | Remove. |
-
-### 2.4 Ad Library
-
-An Org-scoped catalog of reusable creative content. Project Ads can
-reference library items in lieu of inlining a creative
-(`REQUIREMENTS.md` §5.1).
-
-| Verb | Path | Purpose |
-|---|---|---|
-| `GET` | `/v1/orgs/{org_id}/ad-library/items` | List. Filter: `external_id`, `is_active`. |
-| `POST` | `/v1/orgs/{org_id}/ad-library/items` | Create. |
-| `POST` | `/v1/orgs/{org_id}/ad-library/items:batchUpsert` | Bulk by `external_id`. |
-| `GET` | `/v1/orgs/{org_id}/ad-library/items/{item_id}` | Read. |
-| `PATCH` | `/v1/orgs/{org_id}/ad-library/items/{item_id}` | Update. |
-| `GET` | `/v1/orgs/{org_id}/ad-library/items/{item_id}/references` | List the Project Ads referencing this item. |
-
-Body — same `oneOf` creative shape as Project Creatives, plus
-catalog metadata:
-
-```json
-{
-  "external_id":  "library-spring-banner",
-  "name":        "Spring banner — 728x90",
-  "description": "Reusable cross-project spring banner",
-  "creative": {
-    "type":            "image",
-    "image_url":        "https://cdn.example.com/banner.jpg",
-    "width":           728,
-    "height":          90,
-    "alt":             "Spring sale",
-    "click_through_url": "https://acme.example.com/sale"
-  },
-  "is_active": true
-}
-```
-
-`native` template values are validated against the referenced
-template; the template must exist in **every Project that
-references this item**. The `references` endpoint helps spot
-references that would break if the item is archived.
-
-Modifying a library item is reflected in all referring Ads after
-the next snapshot swap (typically <5 s; see `REQUIREMENTS.md` §7.2).
-There is no per-reference override of creative content — that's
-what the inline form is for.
-
-Manage with Org Admin role; Project tokens cannot mutate the library
-but can read it (so referring Ads' creative content can be
-introspected in the admin UI).
-
----
-
-## 3. Project Resources
-
-All endpoints in this section accept either an **Org token** (with
-sufficient role) or a **Project token** scoped to `{project_id}`.
-
-### 3.1 Advertisers
-
-| Verb | Path | Purpose |
-|---|---|---|
-| `GET` | `/v1/projects/{project_id}/advertisers` | List. Filter: `external_id`, `is_active`. |
-| `POST` | `/v1/projects/{project_id}/advertisers` | Create. |
-| `POST` | `/v1/projects/{project_id}/advertisers:batchUpsert` | Bulk by `external_id`. |
-| `GET` | `/v1/projects/{project_id}/advertisers/{id}` | Read. |
-| `PATCH` | `/v1/projects/{project_id}/advertisers/{id}` | Update. |
-
-Body:
-
-```json
-{
-  "external_id": "advertiser-acme",
-  "name":       "Acme Corp",
-  "is_active":   true
-}
-```
-
-### 3.2 Campaigns
-
-| Verb | Path | Purpose |
-|---|---|---|
-| `GET` | `/v1/projects/{project_id}/campaigns` | List. Filter: `advertiser_id`, `external_id`, `is_active`. |
-| `POST` | `/v1/projects/{project_id}/campaigns` | Create. |
-| `POST` | `/v1/projects/{project_id}/campaigns:batchUpsert` | Bulk. |
-| `GET` | `/v1/projects/{project_id}/campaigns/{id}` | Read. |
-| `PATCH` | `/v1/projects/{project_id}/campaigns/{id}` | Update. |
-
-Body:
-
-```json
-{
-  "external_id":   "campaign-spring-2026",
-  "advertiser_id": 555,
-  "name":         "Spring Promo",
-  "is_active":     true
-}
-```
-
-### 3.3 Flights
-
-The unit of delivery. Carries dates, priority, and inventory targeting.
-
-| Verb | Path | Purpose |
-|---|---|---|
-| `GET` | `/v1/projects/{project_id}/flights` | List. Filter: `campaign_id`, `priority_id`, `external_id`, `is_active`, `activeAt=<RFC3339>`. |
-| `POST` | `/v1/projects/{project_id}/flights` | Create. |
-| `POST` | `/v1/projects/{project_id}/flights:batchUpsert` | Bulk. |
-| `GET` | `/v1/projects/{project_id}/flights/{id}` | Read. |
-| `PATCH` | `/v1/projects/{project_id}/flights/{id}` | Update. |
-
-Body:
-
-```json
-{
-  "external_id":  "flight-spring-2026-cardio",
-  "campaign_id":  444,
-  "name":        "Spring Promo — Cardiology",
-  "priority_id":  1,
-  "start_date":   "2026-05-01T00:00:00Z",
-  "end_date":     "2026-06-01T00:00:00Z",
-  "site_ids":     [12],
-  "zone_ids":     [34],
-  "ad_types":     [16],
-  "is_active":    true
-}
-```
-
-`site_ids` / `zone_ids` empty means "any site/zone in the project."
-`ad_types` is required and non-empty.
-
-### 3.4 Ads
-
-The flight↔creative binding plus a delivery weight. Each Ad either
-**inlines** a project-scoped creative or **references** an item in
-the org's Ad Library (§2.4).
-
-| Verb | Path | Purpose |
-|---|---|---|
-| `GET` | `/v1/projects/{project_id}/ads` | List. Filter: `flight_id`, `creative_id`, `ad_library_item_id`, `external_id`, `is_active`. |
-| `POST` | `/v1/projects/{project_id}/ads` | Create. |
-| `POST` | `/v1/projects/{project_id}/ads:batchUpsert` | Bulk. The hot management path for sync jobs. |
-| `GET` | `/v1/projects/{project_id}/ads/{id}` | Read. |
-| `PATCH` | `/v1/projects/{project_id}/ads/{id}` | Update. |
-
-Body — `oneOf` on `creative_id` vs `ad_library_item_id` (exactly one
-required):
-
-```json,ignore
-// Inline creative.
-{
-  "external_id": "ad-2024-spring-1",
-  "flight_id":   333,
-  "creative_id": 4242,
-  "weight":     100,
-  "is_active":   true
-}
-```
-
-```json,ignore
-// Reference an org-shared library item.
-{
-  "external_id":      "ad-2024-spring-1",
-  "flight_id":        333,
-  "ad_library_item_id": "ali_AbCd...",
-  "weight":          100,
-  "is_active":        true
-}
-```
-
-Library references are resolved through the in-memory snapshot at
-decision time; no extra round-trip. Updating a library item updates
-all referencing Ads after the next snapshot swap.
-
-### 3.5 Creatives
-
-| Verb | Path | Purpose |
-|---|---|---|
-| `GET` | `/v1/projects/{project_id}/creatives` | List. Filter: `advertiser_id`, `type`, `external_id`, `is_active`. |
-| `POST` | `/v1/projects/{project_id}/creatives` | Create. |
-| `GET` | `/v1/projects/{project_id}/creatives/{id}` | Read. |
-| `PATCH` | `/v1/projects/{project_id}/creatives/{id}` | Update. |
-| `POST` | `/v1/projects/{project_id}/creatives/{id}/image` | Upload image (multipart). Returns `{ "image_url": "..." }`. |
-
-Body (`oneOf` on `type`):
-
-```json
-{
-  "external_id":      "creative-banner-728x90",
-  "advertiser_id":    555,
-  "name":            "Spring banner — 728x90",
-  "type":            "image",
-  "image_url":        "https://cdn.example.com/banner.jpg",
-  "width":           728,
-  "height":          90,
-  "alt":             "Acme Spring Sale",
-  "click_through_url": "https://acme.example.com/sale"
-}
-```
-
-```json
-{
-  "type":            "html",
-  "body":            "<div>...</div>",
-  "click_through_url": "https://..."
-}
-```
-
-```json
-{
-  "type":            "native",
-  "template_id":      7,
-  "values": {
-    "title":    "...",
-    "body":     "...",
-    "image_url": "...",
-    "cta_text":  "Learn more"
-  },
-  "click_through_url": "https://..."
-}
-```
-
-```json
-{
-  "type":            "templated",
-  "template_id":      7,
-  "values": {
-    "title":    "...",
-    "body":     "...",
-    "image_url": "...",
-    "cta_text":  "Learn more"
-  },
-  "click_through_url": "https://..."
-}
-```
-
-`values` for `native` and `templated` creatives is validated against
-the referenced template's JSON Schema at write time; `422` on schema
-violation. `templated` additionally requires the referenced template
-to carry a non-null `template` (Liquid source) field — `422 /
-template_missing_body` if the referenced template is
-input-validation-only.
-
-`templated` differs from `native` only in **who renders**:
-
-- `native` — server returns `values`; the caller renders client-side.
-  The decision response carries no `body`.
-- `templated` — server renders `template` (Liquid) against `values`
-  at decision time and returns the resulting string in `body` on the
-  decision response. `values` is echoed too so a caller can fall back
-  to its own renderer or display debug info.
-
-Templated rendering happens only on the decision path (`POST
-/v1/projects/{project_id}/decisions`); the creative resource itself
-stores nothing rendered — the `body` field on the wire is not
-persisted on the creative row.
-
-### 3.6 Creative Templates
-
-| Verb | Path | Purpose |
-|---|---|---|
-| `GET` | `/v1/projects/{project_id}/creative-templates` | List. Filter: `name`, `external_id`. |
-| `POST` | `/v1/projects/{project_id}/creative-templates` | Create. |
-| `GET` | `/v1/projects/{project_id}/creative-templates/{id}` | Read. |
-| `PATCH` | `/v1/projects/{project_id}/creative-templates/{id}` | Update; bumps `version`. |
-
-Body:
-
-```json
-{
-  "external_id": "template-sponsored-card-v1",
-  "name":       "sponsored_card_v1",
-  "schema": {
-    "type": "object",
-    "required": ["title", "body", "cta_text"],
-    "properties": {
-      "title":    { "type": "string", "maxLength": 80 },
-      "body":     { "type": "string", "maxLength": 240 },
-      "image_url": { "type": "string", "format": "uri" },
-      "cta_text":  { "type": "string", "maxLength": 24 }
-    },
-    "additionalProperties": false
-  },
-  "template":       "<a href=\"{{ad.click_url}}\"><img src=\"{{values.image_url}}\" alt=\"{{values.title}}\"><span>{{values.title}}</span><p>{{values.body}}</p><span class=\"cta\">{{values.cta_text}}</span><img src=\"{{ad.impression_url}}\" width=\"1\" height=\"1\"></a>",
-  "template_engine": "liquid"
-}
-```
-
-`schema` is the JSON Schema validated against `values` at creative
-write time. It is required.
-
-`template` is an optional Liquid source string. When present, this
-template can be referenced by `templated` creatives, which render it
-server-side at decision time. When absent, the template is
-input-validation-only and can only be referenced by `native`
-creatives. `template` is parsed and rejected with `422 /
-template_parse_error` at write time if it does not parse.
-
-`template_engine` is required when `template` is present; today the
-only accepted value is `"liquid"` (DotLiquid-compatible). The field
-exists so additional engines can be added later without a breaking
-schema change.
-
-Helpers exposed inside `template`:
-
-- `ad.id`, `ad.click_url`, `ad.impression_url` — engine-injected at
-  decision time; the URLs are the same signed values returned at the
-  top level of the decision response.
-- `placement.id` — echo of the request placement key.
-- `decision.snapshot_version` — the current `snapshot_version`.
-- `values.*` — the creative's `values` object, after JSON-Schema
-  validation.
-
-No file, network, or environment access is exposed. Templates run in
-a sandbox with hard caps on render time and output size; both caps
-are configurable via `config.yaml` and surfaced in `/version`.
-
-Mutating `schema` does **not** retroactively re-validate existing
-creatives; it applies to subsequent writes only. The same applies to
-`template` — changes affect subsequent decisions only; in-flight
-creative rows are not invalidated. Use a new template name for
-breaking changes.
-
-### 3.7 Sites
-
-Promoted from read-only — sites are per-project inventory and need to
-be created/updated via API.
-
-| Verb | Path | Purpose |
-|---|---|---|
-| `GET` | `/v1/projects/{project_id}/sites` | List. Filter: `channel_id`, `external_id`, `url`. |
-| `POST` | `/v1/projects/{project_id}/sites` | Create. |
-| `POST` | `/v1/projects/{project_id}/sites:batchUpsert` | Bulk by `external_id`. |
-| `POST` | `/v1/projects/{project_id}/sites/upsert-by-url` | Upsert keyed by URL — natural-key endpoint for URL-driven flows. (Path uses a regular slash-segment instead of the Google-style `:upsertByUrl` custom verb because poem's path matcher routes `sites:foo` and `sites:bar` to the same pattern, which collides with `sites:batchUpsert`. Other resources use `:batchUpsert` because there's only one custom verb per resource.) |
-| `GET` | `/v1/projects/{project_id}/sites/{id}` | Read. |
-| `PATCH` | `/v1/projects/{project_id}/sites/{id}` | Update. |
-
-Body:
-
-```json
-{
-  "external_id": "site-main",
-  "channel_id":  null,
-  "name":       "Main Property",
-  "url":        "https://example.com",
-  "aliases":    ["https://www.example.com", "https://m.example.com"]
-}
-```
-
-`url` and entries in `aliases` are unique within the project (across
-both fields together).
-
-`:upsertByUrl` body:
-
-```json
-{ "url": "https://example.com", "name": "Main Property" }
-```
-
-Returns the existing or newly-created site.
-
-### 3.8 Zones
-
-| Verb | Path | Purpose |
-|---|---|---|
-| `GET` | `/v1/projects/{project_id}/zones` | List. Filter: `site_id`, `external_id`. |
-| `POST` | `/v1/projects/{project_id}/zones` | Create. |
-| `POST` | `/v1/projects/{project_id}/zones:batchUpsert` | Bulk. |
-| `GET` | `/v1/projects/{project_id}/zones/{id}` | Read. |
-| `PATCH` | `/v1/projects/{project_id}/zones/{id}` | Update. |
-
-Body:
-
-```json
-{
-  "external_id": "zone-header",
-  "site_id":     12,
-  "name":       "Header"
-}
-```
-
-### 3.9 Read-only inventory (Channel, Priority, AdType)
-
-Network-level taxonomy. Read-only via API in v0; managed by operator
-via CLI/SQL or seeded at project creation.
-
-| Verb | Path | Purpose |
-|---|---|---|
-| `GET` | `/v1/projects/{project_id}/channels` | List. |
-| `GET` | `/v1/projects/{project_id}/channels/{id}` | Read. |
-| `GET` | `/v1/projects/{project_id}/priorities` | List. Ordered by tier. |
-| `GET` | `/v1/projects/{project_id}/priorities/{id}` | Read. |
-| `GET` | `/v1/projects/{project_id}/ad-types` | List. |
-| `GET` | `/v1/projects/{project_id}/ad-types/{id}` | Read. |
-
-Write endpoints for these resources are post-v0 (see roadmap).
-
----
-
-## 4. Event Tracking
-
-Unauthenticated; HMAC-signed in the URL. Browsers hit these directly
-from the rendered ad.
-
-### `GET /e/i/{signed}`
-
-Impression ping.
-
-- Default: `204 No Content` (returned in all cases below; the ping
-  is fire-and-forget from the browser's perspective).
-- With `?fmt=gif`: `200 OK`, `image/gif`, 43-byte 1×1 transparent GIF.
-- Tampered or expired signature: `204` (silent), counter incremented.
-
-### `GET /e/c/{signed}`
-
-Click ping.
-
-- Records the click, `302` redirect to the creative's
-  `click_through_url`.
-- Tampered or expired signature: `400`.
-- Optional `?u=<url>` overrides the redirect target only if signed into
-  the payload (prevents open-redirect abuse).
-- Replays still 302 to the same URL (so users who hit Back-then-click
-  still land at the destination); see "Replay, dedup, and counts" for
-  what gets counted.
-
-### Replay, dedup, and counts
-
-There is **one canonical count** per event kind: a row is a
-"countable" event iff `is_duplicate = false`. Reporting queries can
-present either the canonical count or the raw count (which includes
-duplicates) depending on use case; billing always uses the canonical
-count.
-
-| Field | Source |
-|---|---|
-| `dedup_key` | `HMAC-SHA256(per-project-secret, kind || signature_nonce)` truncated to 16 bytes. Stable for the lifetime of a signed URL. |
-| Uniqueness | `(project_id, kind, dedup_key)` is unique within `events_raw`. The first hit lands with `is_duplicate = false`; subsequent hits with the same `(kind, dedup_key)` land with `is_duplicate = true`. |
-| Window | Lifetime within retention (default 30 days). After the partition is dropped, dedup state is gone — but so is the original event, so this is moot. |
-
-Behavior summary by event kind:
-
-- **Impression**: every hit is recorded. First → `is_duplicate=false`,
-  countable. Subsequent → `is_duplicate=true`, not counted for billing
-  but visible in raw analysis.
-- **Click**: every hit is recorded *and* every hit redirects (the
-  user expects to land somewhere). First → `is_duplicate=false`,
-  countable. Subsequent → `is_duplicate=true`, redirected, not
-  counted for CTR.
-- **Custom events** (post-v0): same shape.
-
-Canonical SQL conventions:
-
-```sql
--- Billable / reportable count (default).
-SELECT count(*) FROM events_raw
-WHERE kind = 2 AND ts >= ... AND NOT is_duplicate;
-
--- Raw traffic volume (analytics curiosity, abuse triage).
-SELECT count(*) FROM events_raw
-WHERE kind = 2 AND ts >= ...;
-```
-
-`events_rollup` aggregates the canonical (non-duplicate) count only.
-Raw analysis goes against `events_raw` directly.
-
-### Signature payload
-
-HMAC-SHA256 over a compact binary record:
-
-```
-project_id | ad_id | creative_id | placement_id_hash | issued_at | nonce
-```
-
-URL-safe base64. Per-project secret. TTL is configurable per project
-(default 24 h). The 8-hour rotation overlap (REQUIREMENTS.md §6.3)
-applies to the signature secret; `dedup_key` is independent of which
-secret the URL was signed under, so dedup spans rotation cleanly.
-
----
-
-## 5. System
-
-| Verb | Path | Purpose |
-|---|---|---|
-| `GET` | `/openapi.json` | OpenAPI 3.1 spec, generated from the binary. |
-| `GET` | `/healthz` | Liveness. `200` if process is up. |
-| `GET` | `/readyz` | Readiness. `200` only if snapshot loaded, DB reachable, flusher healthy. |
-| `GET` | `/metrics` | Prometheus exposition. |
-| `GET` | `/version` | Build metadata (git sha, build time, schema version) plus the **effective auth policy** — enabled modes and per-issuer summary (issuer URL, audience, algorithms, claim source, JWKS URL). Secrets are never returned. See `AUTH.md` "Startup Linting and Effective-Policy Visibility". |
-| `GET` | `/v1/whoami` | Auth handshake. Validates the bearer (opaque or JWT) and echoes the `Principal` back: `{scope, org_id, project_id?, role, token_type, actor_id}`. The smallest possible auth-required endpoint; the admin SPA hits it after login to confirm the credential is valid before rendering the workspace, and to read `principal.role` for client-side UI gating (server still enforces every authz check). Returns `401 invalid_token` for missing or bad bearers. |
-
----
-
-## 6. Resource Map (cheat sheet)
-
-```
-Org-level (Org token)
-  POST   /v1/orgs/{org_id}/projects                    — provision a project
-  GET    /v1/orgs/{org_id}/projects
-  POST   /v1/orgs/{org_id}/projects:batchUpsert
-  GET    /v1/orgs/{org_id}/projects/{project_id}
-  PATCH  /v1/orgs/{org_id}/projects/{project_id}
-  POST   /v1/orgs/{org_id}/tokens                      — mint API token
-  GET    /v1/orgs/{org_id}/tokens
-  DELETE /v1/orgs/{org_id}/tokens/{token_id}
-  GET/POST/PATCH/DELETE /v1/orgs/{org_id}/members
-
-Decision (Org or Project token)
-  POST   /v1/projects/{project_id}/decisions
-
-Demand-side (full CRUD + batchUpsert)
-  /v1/projects/{project_id}/advertisers
-  /v1/projects/{project_id}/campaigns
-  /v1/projects/{project_id}/flights
-  /v1/projects/{project_id}/ads
-  /v1/projects/{project_id}/creatives             (+ /image upload)
-  /v1/projects/{project_id}/creative-templates
-
-Inventory (full CRUD; sites also support :upsertByUrl)
-  /v1/projects/{project_id}/sites
-  /v1/projects/{project_id}/zones
-
-Read-only inventory taxonomy
-  /v1/projects/{project_id}/channels
-  /v1/projects/{project_id}/priorities
-  /v1/projects/{project_id}/ad-types
-
-Events (public, HMAC-signed)
-  GET    /e/i/{signed}
-  GET    /e/c/{signed}
-
-System
-  GET    /openapi.json
-  GET    /healthz
-  GET    /readyz
-  GET    /metrics
-  GET    /version
-```
-
----
-
-## 7. Out of Scope (v0)
-
-The following endpoints are explicitly **not** in v0 — they map onto
-the roadmap items in `REQUIREMENTS.md` §11. Calls return `404` with
-`code: "not_implemented"`.
-
-- `POST /v1/projects/{project_id}/users/*` — UserDB.
-- Frequency-cap configuration on flights.
-- Geo / IP / day-parting / keyword / custom-property targeting fields.
-- `POST /v1/projects/{project_id}/reports/*` — Reporting API.
-- Webhook subscription endpoints.
-- Custom event types beyond impression/click (`/e/x/{signed}`).
-- Write endpoints for channels / priorities / ad-types.
-- Site Group endpoints.
-- Cross-project broadcast upsert.
+| `POST` | `/v1/orgs/{org_id}/projects:batchUpsert` | Design only. |
+| `PATCH` | `/v1/orgs/{org_id}/projects/{project_id}` | Design only. |
+| `GET` | `/v1/orgs/{org_id}/members` | Design only. |
+| `POST` | `/v1/orgs/{org_id}/members` | Design only. |
+| `PATCH` | `/v1/orgs/{org_id}/members/{user_id}` | Design only. |
+| `DELETE` | `/v1/orgs/{org_id}/members/{user_id}` | Design only. |
+| `POST` | `/v1/orgs/{org_id}/ad-library/items:batchUpsert` | Design only. |
+| `GET` | `/v1/orgs/{org_id}/ad-library/items/{item_id}/references` | Design only. |
+| `PATCH` | `/v1/projects/{project_id}/creatives/{id}` | Design only. |
+
+Other unshipped design areas include project users, reporting endpoints,
+webhooks, custom event kinds, taxonomy writes, and site groups. Their mention in
+[REQUIREMENTS.md](REQUIREMENTS.md), [E2E.md](E2E.md), or
+[PHASES.md](PHASES.md) is not a compatibility commitment.

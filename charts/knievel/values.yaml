@@ -1,27 +1,24 @@
-# Default values for knievel.
-# Spec ref: REQUIREMENTS.md § 8.1 — every block here corresponds to
-# a section of the rendered /etc/knievel/config.yaml.
+# Default values for the current Knievel chart.
+#
+# IMPORTANT: a rendered key is not necessarily consumed by src/config.rs.
+# Legacy template-required values are retained and explicitly labeled below;
+# changing workload templates is outside this documentation correction.
 
 image:
   repository: ghcr.io/knievel-ads/knievel
-  # When empty, the chart uses .Chart.AppVersion. Override to pin
-  # a specific tag (`vX.Y.Z`) or an immutable digest
-  # (`sha256:...`); the rendered Deployment uses the digest form
-  # if `tag` starts with `sha256:`.
+  # Empty uses Chart.appVersion. Use X.Y.Z for a semver image tag, or
+  # sha256:<hex> for repository@sha256:<hex>. A sha-<commit> value is a tag.
   tag: ""
   pullPolicy: IfNotPresent
   pullSecrets: []
 
 nameOverride: ""
 fullnameOverride: ""
-
 replicaCount: 2
 
-# Pod-level annotations and labels (e.g. workload-identity hints).
 podAnnotations: {}
 podLabels: {}
 
-# Resource budget per REQUIREMENTS.md § 8 ("right-sized for v0").
 resources:
   requests:
     cpu: 100m
@@ -30,48 +27,81 @@ resources:
     cpu: "2"
     memory: 1Gi
 
-# Aurora cluster writer endpoint.
 database:
   host: ""
   port: 5432
   name: ""
-  schema: knievel
   sslMode: require
-  # Secret holding `username` + `password` keys (override via
-  # `userKey` / `passwordKey`). Required.
+  # Required for a working pod. The Secret must contain username/password,
+  # unless the key names below are overridden.
   existingSecret: ""
   userKey: username
   passwordKey: password
+  # Effective runtime fields rendered into database.*.
   maxConnections: 8
   autoMigrate: true
-  # When true (the default), a missing or unusable database is a
-  # fatal boot error: the process exits 1 so kubelet enters
-  # CrashLoopBackOff. Set to false only in development clusters
-  # where you want the pod to start without a database (all
-  # project-scoped endpoints will 503 until the DB is reachable).
-  required: true
-  # Exponential-backoff retry settings for the initial Postgres
-  # connection. The server attempts `attempts` times before
-  # treating the failure as fatal (subject to `required` above).
-  connectRetry:
-    attempts: 5
-    initialBackoffMs: 1000
-    maxBackoffMs: 16000
 
+# The template renders all four keys under events.*. The current Rust binary
+# consumes ONLY channel_capacity. retentionDays, flushIntervalMs, and
+# flushBatchSize are ignored; runtime partition retention stays at the Rust
+# default because this chart does not render partitions.retention_days.
 events:
   retentionDays: 30
   flushIntervalMs: 1000
   flushBatchSize: 5000
-  channelCapacity: 10000
+  channelCapacity: 8192
 
 decisions:
   forceOverridesEnabled: false
 
-hmac:
-  # Secret holding the default-key material for new projects.
-  existingSecret: ""
-  key: hmac-default
+logging:
+  level: info
+  format: json
+  # Rendered as logging.decisions_sample_rate, which current Rust ignores.
+  decisionsSampleRate: 0.01
+  requestLogEnabled: true
+  requestLogSkipPaths:
+    - /healthz
+    - /readyz
+  requestLogSlowMs: 1000
 
+api:
+  bindAddr: "0.0.0.0:8080"
+  # ApiConfig requires this field whenever the api block is rendered. The
+  # localhost default keeps lint/render usable; every non-local install must
+  # override it. Current server code parses it but still emits relative /e/...
+  # tracking paths.
+  publicBaseUrl: "http://localhost:8080"
+
+# Public admin-SPA OIDC metadata. The release image serves /admin/ by default;
+# both OIDC and paste-token auth store bearer material in sessionStorage.
+adminUi:
+  oidc:
+    issuer: ""
+    clientId: ""
+    scopes:
+      - openid
+      - profile
+      - knievel
+    requireOidc: false
+
+# Effective API-side JWT policies. Empty means opaque-only. Use RS256: the
+# current decoding-key builder supports RSA JWKs only. See AUTH.md.
+auth:
+  jwt:
+    issuers: []
+    # Example item shape:
+    # - issuer: https://identity.example.com/realms/ads
+    #   audience: knievel
+    #   algorithms: [RS256]
+    #   jwksUrl: ""
+    #   claim: knievel
+    #   claimMapping:
+    #     rules: []
+
+# UNSUPPORTED CURRENTLY. Existing templates reference these values, so they
+# remain for chart compatibility, but render a top-level sentry block that
+# src/config.rs ignores. Even correctly nested errors.sentry is only a stub.
 sentry:
   enabled: false
   existingSecret: ""
@@ -80,85 +110,20 @@ sentry:
   tracesSampleRate: 0.0
   release: ""
 
+# UNSUPPORTED CURRENTLY. Existing templates render a top-level otel block that
+# src/config.rs ignores. Even correctly nested tracing.otel installs no exporter.
 otel:
   enabled: false
   endpoint: ""
   serviceName: knievel
   resourceAttributes: {}
 
-logging:
-  level: info
-  format: json
-  decisionsSampleRate: 0.01
-  # Per-request structured log line (method/path/status/latency_ms/
-  # request_id, plus an x-request-id response header). Defaults to
-  # true. Disable on hot-path-only fleets that ship per-request
-  # observability via OTel spans instead.
-  requestLogEnabled: true
-  # Exact-match path skip-list for the request logger. The default
-  # excludes the kubelet probe paths so /healthz + /readyz traffic
-  # doesn't drown the log stream. Add hot endpoints (e.g. the
-  # decision endpoint at high QPS) here when needed.
-  requestLogSkipPaths:
-    - /healthz
-    - /readyz
-  # Latency above which a request is logged at warn level
-  # regardless of status. Helps surface slow-but-200 paths.
-  requestLogSlowMs: 1000
-
-api:
-  publicBaseUrl: ""
-  bindAddr: "0.0.0.0:8080"
-
-# Admin UI runtime config. Surfaced verbatim to the SPA at
-# GET /admin/config.json so one image works across envs. See
-# AUTH.md "Keycloak Setup — Human Admin UI (PKCE)" and the
-# `admin_ui` block in config.example.yaml.
-#
-# When both `oidc.issuer` and `oidc.clientId` are empty (the
-# default), the chart skips the admin_ui block in config.yaml
-# entirely and the SPA falls through to the paste-a-token form.
-adminUi:
-  oidc:
-    # OIDC issuer URL (e.g. https://identity.example.com/realms/foo).
-    issuer: ""
-    # Public PKCE client ID. No client secret — PKCE replaces it.
-    clientId: ""
-    # Scopes requested by the SPA. `knievel` triggers the Keycloak
-    # claim mapper that emits the `knievel` JWT claim.
-    scopes:
-      - openid
-      - profile
-      - knievel
-    # When true, the SPA hides the paste-a-token fallback so
-    # SSO/MFA/audit policy can't be sidestepped.
-    requireOidc: false
-
-# API-side JWT validation policies. Each entry is a trusted OIDC
-# issuer; the first whose `iss` claim matches the incoming token is
-# used. JWKS is auto-discovered from
-# `{issuer}/.well-known/openid-configuration` when `jwksUrl` is left
-# empty. With an empty list, the API only accepts opaque (`kvl_…`)
-# tokens — the JWT path is disabled.
-#
-# Example (Keycloak human admin UI):
-#   auth:
-#     jwt:
-#       issuers:
-#         - issuer: "https://identity.example.com/realms/foo"
-#           audience: "knievel"
-#           algorithms: ["RS256"]
-#           claim: "knievel"
-auth:
-  jwt:
-    issuers: []
-
 ingress:
   enabled: false
   className: nginx
   annotations: {}
   hosts: []
-    # - host: knievel.example.com
+    # - host: ads.example.com
     #   paths:
     #     - path: /
     #       pathType: Prefix
@@ -173,14 +138,14 @@ serviceAccount:
   name: ""
   annotations: {}
 
+# UNSUPPORTED CURRENTLY. Enabling this renders a valid ServiceMonitor pointed
+# at /metrics, but the server has no /metrics route. Keep disabled.
 serviceMonitor:
   enabled: false
   interval: 30s
   scrapeTimeout: 10s
   labels: {}
 
-# Topology / scheduling. Leave empty for single-zone defaults; the
-# chart README walks through the zone-spread recipe.
 nodeSelector: {}
 tolerations: []
 affinity: {}
@@ -201,7 +166,6 @@ securityContext:
     drop:
       - ALL
 
-# Probes for the standard /healthz + /readyz endpoints.
 probes:
   liveness:
     path: /healthz

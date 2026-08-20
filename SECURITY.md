@@ -1,125 +1,142 @@
-# Security Policy
+# Security policy
 
-## Reporting a vulnerability
+## Report a vulnerability privately
 
-Email **security@knievel-ads.example** (GPG key on the GitHub org
-profile if you'd like to encrypt). Please:
+Use this repository's
+[GitHub private vulnerability reporting form](https://github.com/knievel-ads/knievel/security/advisories/new).
+Private reporting is enabled and routes through GitHub's repository security
+advisory workflow. Do not open a public issue or discussion for a suspected
+vulnerability.
 
-- Don't open a public issue for security findings.
-- Include reproduction steps, an impact assessment, and the
-  affected version (or `main` SHA).
-- Allow up to **5 business days** for an initial response.
+Include, when possible:
 
-We aim for **90-day coordinated disclosure** by default. If you need
-a tighter window because the vulnerability is being exploited in the
-wild, say so — we'll move accordingly. If you need a longer window
-for downstream coordination, also say so; we'll work with you.
+- the affected tag or commit;
+- reproduction steps or a minimal proof of concept;
+- expected and observed behavior;
+- impact, prerequisites, and tenant boundary involved; and
+- whether exploitation is known in the wild.
 
-We don't currently run a paid bug-bounty program; we're happy to
-acknowledge contributions in `CHANGELOG.md` (and on a future security
-advisories page) if you'd like the credit.
+The maintainers will coordinate investigation, remediation, credit, and a
+publication date in the private advisory. This project does not advertise a paid
+bug-bounty program.
 
-## Supported versions
+## Supported revisions
 
-| Version | Status |
-|---|---|
-| `0.1.x` (latest) | ✅ supported |
-| `0.0.x` (squat) | ❌ end-of-life — never published a real release. |
+Security fixes target `main` and the latest tagged release. Backports to older
+pre-1.0 tags are assessed case by case; no fixed support window is promised.
+The GitHub Releases page and security advisories are the source for published
+fixes.
 
-Once `0.2.0` ships, `0.1.x` will receive security fixes for **6 months**
-in line with the deprecation window in `REQUIREMENTS.md` § 6.4. After
-that, `0.1.x` is end-of-life.
+## Shipped trust boundaries
 
-## Security model
+### Server API
 
-Three paragraphs covering the v0 perimeter; the operator owns the
-infrastructure-side details.
+Management and decision operations require an `Authorization: Bearer` header.
+The caller is responsible for authenticating its own users and protecting the
+bearer. Knievel accepts:
 
-### 1. Trust boundary
+- opaque `kvl_...` tokens looked up under a one-row RLS bootstrap and verified
+  with Argon2; and
+- JWT-shaped tokens when at least one `auth.jwt.issuers` policy is configured.
 
-Knievel is a **server-to-server** API in v0. Every authenticated
-request comes from a calling application holding a bearer token; the
-calling application is trusted to authenticate its own end users.
-The browser-facing surface is limited to the HMAC-signed
-`/e/i/{sig}` and `/e/c/{sig}` event endpoints, where the signature
-in the URL is the authorization. There is no public CORS-relaxed
-decision endpoint, no first-party-cookie session, and no anonymous
-write surface.
+Opaque mode is not disabled by an `auth.modes` field. The opaque token's `env`
+segment is parsed but not checked against deployment configuration. Stored IP
+allowlists are not enforced by the request path. Project-token mint validates
+that a project ID is present but does not prove it belongs to the path org, so
+minting must remain a trusted org-admin operation. JWT runtime verification
+currently builds decoding keys only for RSA JWKs; configure RS256 rather than
+relying on the parsed ES256 default. See [AUTH.md](AUTH.md).
 
-Out-of-scope (operator-owned): TLS termination, WAF / DDoS
-protection, IP allow-listing, network segmentation, and the
-authenticity of the calling application itself.
+Public direct routes are deliberately different:
 
-### 2. Tenant isolation
+- `/healthz`, `/readyz`, `/version`, `/openapi.json`, and
+  `/admin/config.json` are unauthenticated;
+- `/e/i/{signed}` and `/e/c/{signed}` use the HMAC-bearing path as
+  authorization; and
+- `/admin/*` serves browser application files when enabled.
 
-Postgres `FORCE ROW LEVEL SECURITY` is the floor:
+Put system metadata behind a reverse proxy if it should not be internet-visible.
+Signed event URLs are credentials until expiry: avoid leaking them through
+analytics, referrers, support logs, or chat transcripts.
 
-- Every per-tenant table has an RLS policy keyed on
-  `current_setting('knievel.org_id')` and (where applicable)
-  `current_setting('knievel.project_id')`.
-- The query layer sets both GUCs at the start of every project-
-  scoped transaction (`src/handlers.rs::open_project_tx`).
-- CI enforces a **third layer**: `xtask check-cross-tenant`
-  fails the build if a project-scoped endpoint is missing from
-  `tests/cross_tenant_manifest.toml`. As of `v0.1.6`, 47
-  endpoints are covered.
+### Browser admin application
 
-A superuser-on-the-app-role mistake silently defeats RLS. The
-reference compose stack and the CI test harness both downgrade the
-app role to `NOSUPERUSER CREATEDB` immediately after creation;
-operator-managed Postgres deploys must do the same. Documented as
-gotcha 17 in `CLAUDE.md`.
+The first-party admin SPA is a browser-facing authenticated surface, not merely
+a server-to-server API viewer. OIDC Authorization Code + PKCE and the
+paste-token fallback both leave bearer material in `window.sessionStorage`.
+OIDC state also uses `sessionStorage`; tokens survive refresh in the tab and are
+removed with the tab/session, but they are not HttpOnly.
 
-`REQUIREMENTS.md` § 7.1.1 has the full RLS contract.
+Consequences:
 
-### 3. Authentication
+- any same-origin XSS can read and exfiltrate the bearer;
+- browser extensions and local device compromise are outside the server's
+  boundary;
+- TLS, CSP/reverse-proxy headers, origin isolation, and admin network exposure
+  are operator responsibilities; and
+- `admin_ui.oidc.require_oidc=true` hides paste-token login but does not change
+  browser storage.
 
-Two authentication paths, configured per project:
+The UI reads `/v1/whoami` and hides controls by role, but that is usability only.
+Every authorization decision remains server-side. Do not grant the browser an
+org-owner token when a narrower project role is sufficient.
 
-- **Opaque bearers** (`kvl_<env>_<scope>_<short-id>_<secret>`) —
-  hashed with argon2id at rest, verified on every request. Default
-  Argon2id parameters per OWASP recommendations (memory 64 MiB,
-  iterations 3, parallelism 1).
-- **JWTs via JWKS** — issuer + audience matched against config;
-  JWKS auto-discovered from the `iss` claim's well-known endpoint
-  with a 5-minute cache. Claim mapping configurable per issuer.
+### Tenant isolation
 
-Event endpoints use HMAC-SHA256 signatures with stable `dedup_key`
-across an 8-hour signing-secret rotation overlap. Replays are
-silently dropped at the dedup layer; impressions/clicks are
-idempotent.
+Tenant tables use PostgreSQL `ENABLE ROW LEVEL SECURITY` and `FORCE ROW LEVEL
+SECURITY`. A project request follows the security-sensitive path
+`auth/security.rs` → `db.rs` → `handlers.rs`:
 
-`AUTH.md` covers the full surface, including the K8s service-account
-recipe and the rotation procedure.
+1. authenticate to a `Principal`;
+2. bind only the principal's `org_id`;
+3. verify that the path project belongs to that org; and
+4. bind `project_id` for the remaining transaction.
 
-## What's deliberately out of scope
+The application DB role must be `NOSUPERUSER NOBYPASSRLS`; PostgreSQL
+superusers bypass forced RLS. CI's migration and manifest gates add useful
+coverage, but `tests/cross_tenant_manifest.toml` is an operation registry and
+does not itself execute its diagnostic `test` names.
 
-Operator-owned items that knievel doesn't ship:
+### Background loader role
 
-- **TLS termination.** A reverse proxy (nginx, Envoy, ALB, etc.) sits
-  in front of knievel.
-- **Network policy / WAF.** Use your cloud's tools.
-- **S3 bucket policy.** The operator scopes the IAM role / bucket
-  policy on the upload target.
-- **OS hardening.** The container ships distroless; the operator
-  picks the host kernel.
-- **Backup encryption.** The operator owns backup encryption at
-  rest.
-- **Per-region key management.** Single-region in v0; multi-region
-  KMS isn't a knievel concern.
+The process also needs a `NOLOGIN BYPASSRLS` role named `knievel_loader` for
+cross-tenant snapshot reads and rollup work. It is assumed only with
+transaction-scoped `SET LOCAL ROLE`; request handlers must never use it.
+Production grants should limit it to SELECT on snapshot/event inputs and
+INSERT/UPDATE on the two rollup outputs. A login-capable or broadly writable
+loader role expands the blast radius substantially.
 
-## Known surface gotchas
+### Event and image data
 
-Documented for awareness; none are bugs in knievel:
+Event buffering and uploaded image bytes are process memory:
 
-- **Postgres `FORCE ROW LEVEL SECURITY` is bypassed by superusers.**
-  See § 2 above.
-- **Aurora drops LISTEN/NOTIFY across failovers.** The poll backstop
-  catches up within 5 seconds; no durable contract loss.
-- **Argon2id verification is the most expensive part of the hot
-  path.** Per-request, dwarfs the HTTP framing + DB lookup. Bench
-  before tuning.
+- event batches can be lost on DB flush failure or process shutdown;
+- upload bytes disappear on restart and are not shared across replicas; and
+- the raw-event uniqueness key includes `ts`, so replay dedup is not a
+  billing-grade guarantee across different timestamps.
 
-## Disclosure log
+Do not use the in-memory upload operation as durable content storage. Review
+[REPORTING.md](REPORTING.md) before treating `is_duplicate` or rollups as a
+security/fraud control.
 
-(To be populated as advisories ship.)
+## Operator-owned controls
+
+Knievel does not terminate TLS or ship a WAF, DDoS control, Kubernetes
+NetworkPolicy, backup encryption, secret manager, durable object store, or
+Prometheus endpoint. Operators own:
+
+- TLS and trusted proxy configuration;
+- network segmentation and admin-route exposure;
+- DB role creation, credential rotation, backups, and encryption;
+- OIDC client/issuer policy and short browser token lifetimes;
+- protection of opaque tokens and HMAC event URLs;
+- archive/drop policy for detached event partitions; and
+- image hosting when durable creative assets are required.
+
+The distroless image runs as non-root, and the chart defaults to a read-only root
+filesystem and dropped Linux capabilities. Those defaults do not replace the
+controls above.
+
+## Disclosure history
+
+Published reports appear as GitHub Security Advisories for this repository.

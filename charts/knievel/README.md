@@ -1,49 +1,148 @@
-# knievel
+# Knievel Helm chart
 
-Knievel — fearlessly fast ad delivery that steals the show.
+This chart deploys the Knievel server/admin image and renders a YAML ConfigMap.
+Read the root [deployment guide](../../DEPLOYMENT.md) before production use;
+several legacy chart values are intentionally disclosed as ignored or stubbed.
 
-This is the official Helm chart for [knievel](https://github.com/knievel-ads/knievel),
-a Rust ad-serving platform inspired by Kevel's domain model.
+## Minimal install
 
-## TL;DR
-
-```bash
-helm install knievel oci://ghcr.io/knievel-ads/charts/knievel \
-  --set database.host=aurora-cluster.example.com \
+```sh
+helm upgrade --install knievel \
+  oci://ghcr.io/knievel-ads/charts/knievel \
+  --set database.host=db.example \
   --set database.name=knievel \
-  --set database.existingSecret=knievel-db
+  --set database.existingSecret=knievel-db \
+  --set api.publicBaseUrl=https://ads.example
 ```
 
-## Prerequisites
+Requirements:
 
-- Kubernetes ≥ 1.27 (the chart uses standard apps/v1 + networking.k8s.io/v1).
-- A reachable Postgres 14+ cluster (Aurora-PostgreSQL recommended per
-  `REQUIREMENTS.md` § 8 ("native Aurora-PostgreSQL")).
-- A `Secret` carrying the DB username and password (referenced via
-  `database.existingSecret`).
-- Optional: kube-prometheus-stack for `ServiceMonitor` scraping.
+- a Kubernetes cluster supporting `apps/v1` and `networking.k8s.io/v1`;
+- reachable PostgreSQL (the reference and CI environment use PostgreSQL 16);
+- a non-superuser application role and separately provisioned loader role;
+- a Secret containing `username` and `password`; and
+- an explicit production `api.publicBaseUrl`.
 
-## Values
+The chart default for `api.publicBaseUrl` is a localhost value only so strict
+lint/render works. Override it in every non-local install. The server currently
+parses this field but still emits relative `/e/...` tracking paths.
 
-The full surface is documented in `values.yaml`. Highlights:
+## Image tags and digests
 
-| Path                       | Purpose                                                         |
-|----------------------------|-----------------------------------------------------------------|
-| `image.repository`         | Default `ghcr.io/knievel-ads/knievel`. Pin a digest in `image.tag`.     |
-| `replicaCount`             | Default 2. The platform is stateless, scale horizontally.       |
-| `database.host`            | Aurora cluster writer endpoint. Required.                       |
-| `database.existingSecret`  | Secret with `username` + `password` keys.                       |
-| `database.autoMigrate`     | Run migrations at boot. `true` for v0; flip off in CD pipelines that run migrations as a separate job. |
-| `events.retentionDays`     | Per `REQUIREMENTS.md` § 7.3 (default 30).                       |
-| `decisions.forceOverridesEnabled` | Project-level kill-switch on `force.*` overrides.        |
-| `sentry.*` / `otel.*`      | Both off by default; enable per environment.                    |
-| `serviceMonitor.enabled`   | Emits a `monitoring.coreos.com/v1` ServiceMonitor.              |
-| `ingress.*`                | Off by default; configure for north-south traffic.              |
+A release Git tag has a leading `v`, but the current image workflow publishes
+semver tags without it: `X.Y.Z`, `X.Y`, and `X`, plus `sha-<commit>`.
 
-## Multi-AZ / topology spread
+A tag value renders with `:`:
 
-For HA across availability zones (a soft expectation in v0,
-graduating to a hard one in Phase 5):
+```yaml
+image:
+  repository: ghcr.io/knievel-ads/knievel
+  tag: "X.Y.Z"
+```
+
+A real digest value renders with `@`:
+
+```yaml
+image:
+  repository: ghcr.io/knievel-ads/knievel
+  tag: "sha256:<manifest-digest>"
+```
+
+`sha-<commit>` is an image tag, not an OCI digest. Prefer the manifest digest
+for reproducible rollout. When `image.tag` is empty, the chart uses
+`.Chart.AppVersion`; the release workflow overrides chart version/appVersion at
+package time.
+
+The release manifest is keyless-signed. Verify a pinned digest with:
+
+```sh
+cosign verify ghcr.io/knievel-ads/knievel@sha256:<manifest-digest> \
+  --certificate-identity-regexp \
+    'https://github.com/knievel-ads/knievel/.github/workflows/release.yml.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+## Database Secret and roles
+
+The default key names are `username` and `password`:
+
+```yaml
+database:
+  host: db.example
+  port: 5432
+  name: knievel
+  sslMode: require
+  existingSecret: knievel-db
+  userKey: username
+  passwordKey: password
+  maxConnections: 8
+  autoMigrate: true
+```
+
+The ConfigMap references Secret-projected environment variables rather than
+containing credentials. If `existingSecret` is empty, those variables are not
+created and config interpolation fails at startup.
+
+The Secret's login must be `NOSUPERUSER NOBYPASSRLS`. Provision
+`knievel_loader NOLOGIN BYPASSRLS`, membership, and least-privilege grants before
+starting the workload. Exact SQL is in [DEPLOYMENT.md](../../DEPLOYMENT.md).
+
+## Effective runtime values
+
+| Value | Current effect |
+|---|---|
+| `image.*`, `replicaCount` | Workload image and replicas. |
+| `database.host`, `port`, `name`, `sslMode`, Secret keys | PostgreSQL URL. |
+| `database.maxConnections`, `autoMigrate` | Rust DB pool and boot migration behavior. |
+| `events.channelCapacity` | In-memory event queue capacity. |
+| `decisions.forceOverridesEnabled` | Global force gate. |
+| `logging.level`, `format`, `requestLog*` | Working structured/request logging. |
+| `api.bindAddr`, `publicBaseUrl` | Typed API config; base URL is parsed but not applied to tracking paths. |
+| `adminUi.oidc.*` | Public SPA OIDC runtime metadata. |
+| `auth.jwt.issuers` | Enables JWT verification alongside opaque tokens. |
+| ingress/service/probes/scheduling/security contexts | Kubernetes workload behavior. |
+
+Use RS256 JWT policies; current runtime decoding-key construction supports RSA
+JWKs only.
+
+## Ignored and unsupported values
+
+The existing workload templates still reference these values, so they remain in
+`values.yaml`, but operators must not rely on them:
+
+| Value | Why unsupported |
+|---|---|
+| `events.retentionDays` | Renders under `events.retention_days`; Rust expects `partitions.retention_days`. Runtime stays at its default. |
+| `events.flushIntervalMs`, `events.flushBatchSize` | Rust uses constants and ignores these keys. |
+| `logging.decisionsSampleRate` | No consumer in `LoggingConfig`. |
+| `sentry.*` | Template renders an unrecognized top-level block; even the recognized Rust block is SDK-stubbed. |
+| `otel.*` | Template renders an unrecognized top-level block; even the recognized Rust block has no exporter. |
+| `serviceMonitor.enabled` | Renders a scrape for `/metrics`, but Knievel has no `/metrics` route. Leave false. |
+
+The chart also cannot configure persistent image storage. Creative uploads use
+process-local memory and disappear on restart.
+
+## Admin UI
+
+The release image sets the static admin directory by default, so `/admin/` is
+served even though the chart does not render `admin_ui.static_dir`. Configure
+OIDC public metadata through `adminUi.oidc`. With `requireOidc=false`, users can
+paste an opaque token.
+
+Both OIDC and paste-token flows use browser `sessionStorage`. Use TLS, restrict
+admin reachability, and review the root [security policy](../../SECURITY.md).
+
+## Probes and metrics
+
+- Liveness `/healthz` checks process HTTP serving.
+- Readiness `/readyz` checks DB `SELECT 1` only; it does not check snapshot or
+  event-flusher health.
+- There is no metrics endpoint. Do not enable ServiceMonitor.
+
+## Topology example
+
+Scheduling values are passed through directly. A hard zone spread can be set as
+follows, after adapting label selectors to the rendered release labels:
 
 ```yaml
 topologySpreadConstraints:
@@ -53,51 +152,19 @@ topologySpreadConstraints:
     labelSelector:
       matchLabels:
         app.kubernetes.io/name: knievel
-
-affinity:
-  podAntiAffinity:
-    preferredDuringSchedulingIgnoredDuringExecution:
-      - weight: 100
-        podAffinityTerm:
-          topologyKey: topology.kubernetes.io/zone
-          labelSelector:
-            matchLabels:
-              app.kubernetes.io/name: knievel
 ```
 
-`whenUnsatisfiable: DoNotSchedule` makes the constraint hard — pods
-won't schedule if a zone is missing capacity, surfacing the problem
-loudly. The soft `podAntiAffinity` adds a tie-breaker for the
-scheduler when capacity is plentiful.
+## Validate a values change
 
-## Pinning a digest
-
-Pin a per-commit `sha-<short>` digest in `image.tag` for reproducible
-deploys (the per-commit images are published by
-`.github/workflows/main-image.yml`):
-
-```bash
-helm upgrade knievel oci://ghcr.io/knievel-ads/charts/knievel \
-  --set image.tag=sha256:<digest>
+```sh
+helm lint --strict charts/knievel
+helm template knievel charts/knievel \
+  --set database.host=db.example \
+  --set database.name=knievel \
+  --set database.existingSecret=knievel-db \
+  --set api.publicBaseUrl=https://ads.example >/tmp/knievel-rendered.yaml
 ```
 
-The chart honors any `tag` starting with `sha256:` and renders the
-image reference as `repository@sha256:...` instead of `repository:tag`.
-
-## Verifying the image
-
-The image is cosign-signed keyless via GitHub OIDC. Verify before
-pulling into a cluster:
-
-```bash
-cosign verify ghcr.io/knievel-ads/knievel@sha256:<digest> \
-  --certificate-identity-regexp 'https://github.com/knievel-ads/knievel/.github/workflows/release.yml.*' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
-```
-
-## Refs
-
-- `REQUIREMENTS.md` § 8 (Deliverables, Helm chart is item 6) and § 8.1.
-- `TESTING.md` § 12.4 / § 12.6 (Helm-related CI gates).
-- The chart is `helm lint` clean and `kubeconform`-validated against
-  Kubernetes 1.30 + the kube-prometheus-stack CRDs (for `ServiceMonitor`).
+Rendering proves Kubernetes/YAML shape only. Compare the rendered ConfigMap with
+[`src/config.rs`](../../src/config.rs) before describing a chart value as
+working.

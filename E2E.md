@@ -1,5 +1,11 @@
 # Kind-helm E2E plan
 
+> **Status — unimplemented design proposal.** The kind/Helm rig, fixture paths,
+> and guarantees described below are not present in the repository or CI. This
+> file is retained as design input, not as evidence of end-to-end coverage. Use
+> [README.md](README.md) for observed coverage and [CODEMAP.md](CODEMAP.md) for
+> the test slices that actually run.
+
 Black-box validation that `helm install knievel` against a real
 Kubernetes cluster produces a working deployment. Sits one
 level above `TESTING.md` § 7 (compose-stack acceptance) — that

@@ -1,400 +1,230 @@
-# Architecture
+# Knievel architecture
 
-This doc describes how knievel is built and what runs in-process. The
-audience is an evaluator or operator who's read the README and is
-asking "will it work in my stack?" Diagrams first; code where
-behavior is non-obvious. Detailed spec rules live in
-`REQUIREMENTS.md`; this doc is the picture.
+This document describes the code that currently ships. Start with
+[CODEMAP.md](CODEMAP.md) for file ownership and [API.md](API.md) for the exact
+HTTP operation set. Design records in [REQUIREMENTS.md](REQUIREMENTS.md) are not
+runtime evidence.
 
-## 1. Where knievel sits
+## Process shape
 
-```
-                    ┌─────────────────────┐
-                    │ Calling app         │
-                    │ (Rails/Node/Go/...) │
-                    └──────────┬──────────┘
-                               │  HTTPS, Bearer token
-                               ▼
-                ┌─────────────────────────────┐
-                │           knievel           │
-                │ ┌─────────────────────────┐ │
-                │ │ poem + poem-openapi     │ │
-                │ │ in-mem snapshot         │ │
-                │ │ event channel + flusher │ │
-                │ │ partition manager       │ │
-                │ │ idempotency cache       │ │
-                │ │ HMAC URL signer         │ │
-                │ └─────────────────────────┘ │
-                └────┬─────────────────┬──────┘
-                     │                 │
-            SQL +    │                 │  S3 PUT/GET
-            LISTEN   ▼                 ▼
-            ┌────────────────┐  ┌────────────────────┐
-            │   Postgres     │  │ S3-compatible store │
-            │ (config rows + │  │ (creative images)   │
-            │  partitioned   │  └────────────────────┘
-            │  events)       │
-            └───────┬────────┘
-                    │ COPY downstream (operator-owned)
-                    ▼
-           ┌─────────────────────┐
-           │  Warehouse / BI     │
-           └─────────────────────┘
+Knievel is one Tokio process plus PostgreSQL:
 
-       ┌────────────────────────┐    ┌────────────────────┐
-       │   OTel collector       │    │      Sentry        │
-       │ (metrics + traces)     │    │ (error reports)    │
-       └────────────────────────┘    └────────────────────┘
-              ▲                                ▲
-              │ OTLP                           │ HTTP
-              └────────────────────────────────┘
-                          all from knievel
+```text
+                       generated OpenAPI handlers
+client ── bearer ──> auth / role / tenant transaction
+                              │
+                              ▼
+                    management SQL or RAM selection
+                              │
+                 ┌────────────┴────────────┐
+                 ▼                         ▼
+          bounded event channel      HTTP response with
+                 │                   signed tracking paths
+                 ▼                         │
+        per-row PostgreSQL INSERT          ▼
+                 │                  GET /e/i or /e/c
+                 ▼                         │
+        partitioned events_raw <───────────┘
+                 │
+                 ▼
+          hourly events_rollup
 ```
 
-The trust boundary is **server-to-server** in v0. Every HTTP call to
-knievel comes from a calling application authenticated by a bearer
-token; browser-direct calls are out of scope (no CORS, no first-party
-cookies, no public ad-decision endpoint). The `/e/i/{sig}` and
-`/e/c/{sig}` event endpoints are unauthenticated by design — they're
-hit from end-user browsers — but the HMAC signature in the URL is the
-authorization, not session state.
+There is no Redis, Kafka, external snapshot service, persistent object-storage
+adapter, metrics exporter, OTel exporter, or Sentry SDK in the running process.
 
-Postgres, the object store, the OTel collector, and Sentry are all
-operator-supplied. Knievel ships with sensible defaults but doesn't
-embed any of them.
+## Boot sequence
 
-## 2. Component map
+[`src/main.rs`](src/main.rs) loads typed configuration and initializes the
+`tracing-subscriber` logger. [`src/server.rs`](src/server.rs) then:
 
-In-process pieces, all running in the same Rust binary:
+1. creates the JWT verifier from configured issuers;
+2. connects to PostgreSQL with bounded retries when `database.url` is set;
+3. optionally runs additive sqlx migrations;
+4. creates an in-memory creative-image store;
+5. starts the event flusher, advisory-lock leader loop, partition manager,
+   rollup loop, and per-pod snapshot loader;
+6. builds OpenAPI and direct poem routes; and
+7. mounts the admin bundle when `admin_ui.static_dir` is non-empty.
 
-| Component | Source | Responsibility |
-|---|---|---|
-| HTTP server | `src/server.rs`, `src/handlers.rs` | `poem` route table; OpenAPI spec at `/openapi.json`; per-request authz prologue. |
-| Snapshot | `src/snapshot.rs`, `src/state.rs` | In-memory `(project_id, resource)` map. The decision hot path reads from here. |
-| Snapshot loader | `src/snapshot.rs` | LISTEN on `knievel.snapshot_changes`; 5 s poll backstop; atomic swap on diff. |
-| Event channel + flusher | `src/events.rs`, `src/event_endpoints.rs` | Per-event channel sender; background flusher batches via `COPY` every 1–2 s. |
-| Partition manager | `src/partitions.rs`, `src/leader.rs` | Pre-makes 4 days of `events_raw` leaf partitions; drops past-retention; runs only on the elected leader. |
-| Idempotency cache | `src/idempotency.rs` | Replay store keyed on `(project, key, route, body-hash)`; 24 h TTL. |
-| Auth | `src/auth/` | Opaque-token verify (argon2id), JWT verify (JWKS auto-discovery), role mapping. |
-| HMAC URL signer | `src/hmac.rs` | Mints + verifies impression/click URL signatures with stable `dedup_key` across signing-secret rotation. |
-| Image upload | `src/image_upload.rs` | Multipart receive → magic-byte sniff → S3 PUT through the configured store. |
-| Migrations | `src/migrate.rs` | `sqlx::migrate!` runner; `auto_migrate: true` on startup or invoked via `knievel-cli migrate`. |
+A production config defaults `database.required` to true. Missing/unusable DB
+configuration is fatal. Tests construct `Config::default()` with `required`
+false, which preserves an explicit DB-less mode.
 
-There is no second datastore. The snapshot is rebuilt from Postgres on
-boot; the event channel buffer is bounded and lossy under saturation
-(see § 10).
+## Route and contract assembly
 
-## 3. Hot path: a decision request, end to end
+The generated API tuple appears in both [`src/server.rs`](src/server.rs) and
+[`src/lib.rs`](src/lib.rs). The first owns live routing; the second owns
+`openapi_spec_yaml()` for xtask. Both must change together.
 
-```
- caller                                                     knievel                                            postgres
-   │                                                          │                                                  │
-   │  POST /v1/projects/{p}/decisions  (Bearer kvl_…)         │                                                  │
-   ├─────────────────────────────────────────────────────────▶│                                                  │
-   │                                                          │ ➀ parse + verify bearer (argon2id) ──────────────│
-   │                                                          │ ➁ resolve principal → (org, project, role)        │
-   │                                                          │ ➂ read snapshot[project_id]            (in-memory)│
-   │                                                          │ ➃ filter ads (site/zone/ad_type/date/blocks)      │
-   │                                                          │ ➄ priority tier + weighted-random selection       │
-   │                                                          │ ➅ HMAC-mint /e/i/* and /e/c/* URLs                │
-   │                                                          │ ➆ enqueue `decision` event (lossy on full chan)   │
-   │                          200 OK + decisions[]             │                                                  │
-   │◀─────────────────────────────────────────────────────────┤                                                  │
-   │                                                          │                                                  │
-```
+`src/server.rs` also mounts non-OpenAPI routes:
 
-Steps 1–6 are pure RAM after the auth-table read. The auth read is the
-only DB hop on the hot path; it's covered by a per-request transaction
-that binds `(org_id, project_id)` GUCs for RLS. Step 7 is non-blocking
-— the channel has 8 192 default slots; over-saturation drops events
-and the metric `events.dropped` ticks (see § 10).
+- `/openapi.json` from the live OpenAPI service;
+- `/admin/config.json` from [`src/admin_ui.rs`](src/admin_ui.rs);
+- `/e/i/:signed` and `/e/c/:signed` from
+  [`src/event_endpoints.rs`](src/event_endpoints.rs); and
+- `/admin/*` from a static directory with SPA fallback.
 
-Sub-millisecond budget targets (per `REQUIREMENTS.md` § 9; "TARGET
-(unverified)" until the bench in `bench/results/v0.1.md` lands):
+Request logging wraps the route tree when enabled and stamps `x-request-id`.
+CORS is installed only when `api.allowed_origins` is non-empty; origins are
+literal, credentials are disabled, and the middleware allows the admin
+application's bearer/header set.
 
-- p50 ≤ 8 ms
-- p99 ≤ 25 ms
-- p99.9 ≤ 75 ms
+## Authentication and tenant isolation
 
-Steps 1–2 dominate the budget today (auth verify + DB round-trip).
-Step 3 is a single hashmap read.
+### Bearer extraction
 
-## 4. Cold path: an event ping, end to end
+[`src/auth/security.rs`](src/auth/security.rs) distinguishes JWTs by a valid
+three-segment shape whose decoded header has `alg`. A configured JWT verifier
+handles that shape. Other bearer strings go through the opaque-token parser.
 
-```
- browser                                                    knievel                                           postgres
-   │                                                          │                                                  │
-   │  GET /e/i/<signed>                                       │                                                  │
-   ├─────────────────────────────────────────────────────────▶│                                                  │
-   │                                                          │ ➀ HMAC verify (current + previous secret window) │
-   │                                                          │ ➁ look up dedup_key in events.dedup table        │
-   │                                                          │ ➂ enqueue event (silent on dup or invalid sig)   │
-   │                                                          │ ➃ respond 204 (or transparent GIF on ?fmt=gif)   │
-   │                          204 No Content                  │                                                  │
-   │◀─────────────────────────────────────────────────────────┤                                                  │
-   │                                                          │                                                  │
-   │                                          (every 1–2 s)   │                                                  │
-   │                                                          │ ➄ flusher COPY-batch enqueued events ────────────▶│
-   │                                                          │                              INSERT events_raw   │
-   │                                                          │                                                  │
-   │                                          (hourly)        │                                                  │
-   │                                                          │ ➅ rollup leader: events_raw → events_rollup_*   ▶│
-```
+Opaque lookup has a deliberate bootstrap exception: before the tenant is known,
+`db::begin_auth_lookup` binds `knievel.auth_lookup_id`, allowing RLS to reveal
+only the named token row. Argon2 verifies the secret and produces a common
+`Principal`.
 
-The endpoint **always** returns 204 (or the transparent GIF if
-`?fmt=gif`) — even on bogus signatures — so an attacker can't probe
-for valid `dedup_key`s by status code. Invalid sigs ignore the event
-silently; the metric `events.bad_signature` ticks.
+### Project binding
 
-## 5. Configuration lifecycle
+[`handlers::open_project_tx`](src/handlers.rs) enforces role and project scope,
+then performs two-stage binding:
 
-Management writes don't touch the snapshot directly. They go through
-the same DB write path every CRUD endpoint uses, and the snapshot
-catches up via Postgres notifications.
+1. begin a transaction with only the principal's `knievel.org_id`;
+2. query the path project under that org-only policy; and
+3. after ownership succeeds, set `knievel.project_id` locally.
 
-```
-   ┌────────────┐         ┌────────────┐        ┌───────────────────┐
-   │ caller     │  PATCH  │ knievel    │  SQL   │ Postgres          │
-   │ (Ruby gem) │ ───────▶│ HTTP layer │ ──────▶│  - row UPDATE     │
-   └────────────┘         └────────────┘        │  - NOTIFY snap_ch │
-                                                 └─────────┬─────────┘
-                                                           │
-                                                           │ LISTEN
-                                                           ▼
-                                                 ┌───────────────────┐
-                                                 │ snapshot loader   │
-                                                 │  (every knievel)  │
-                                                 │ - diff-pull rows  │
-                                                 │ - new map built   │
-                                                 │ - atomic swap     │
-                                                 └───────────────────┘
-```
+Binding the unverified path project before step 2 would let the projects
+policy's project-id branch prove itself. This ordering is a security invariant.
+Tenant migrations enable and force RLS, but PostgreSQL superusers still bypass
+it. Request traffic must use a non-superuser app role.
 
-The bound: **5 s worst-case staleness.** LISTEN/NOTIFY is the fast
-path; a 5 s poll backstop catches dropped notifications (Aurora
-failovers drop them silently — see `CLAUDE.md` cross-cutting risk 2).
-Decisions made within that 5 s window can read pre-update state.
+### Loader role
 
-The snapshot swap is wholesale (build a new map, replace the
-`Arc<Snapshot>`). No per-key locking on the read path; readers see a
-consistent view of one version or the other.
+`knievel_loader` is a separately provisioned `NOLOGIN BYPASSRLS` role granted
+to the app role. Only snapshot and rollup transactions execute
+`SET LOCAL ROLE knievel_loader`. `SET LOCAL` returns the pooled connection to
+its prior role at transaction end. Production grants should give it SELECT on
+snapshot inputs and INSERT/UPDATE only on rollup outputs; it is not a request
+identity.
 
-## 6. Storage model
+## Snapshot lifecycle
 
-One Postgres schema, `knievel`, holds everything. Every table has
-`FORCE ROW LEVEL SECURITY` enabled with a policy keyed on
-`current_setting('knievel.org_id')` and (for project-scoped tables)
-`current_setting('knievel.project_id')`. The handler layer's
-`open_project_tx` prologue sets both GUCs at the start of every
-project-scoped request.
+Every DB-backed pod creates an empty [`SnapshotStore`](src/snapshot.rs) and
+spawns a cold load. `load_snapshot` opens one loader-role transaction and reads
+all active projects, flights, ads, sites, zones, creatives/templates, and
+project signing state into a fresh map. A complete `Arc<Snapshot>` replaces the
+old value in one swap, so a request sees one consistent version.
 
-```
-          ┌──────────────────────────────────────────┐
-          │ schema: knievel                          │
-          │                                          │
-          │  ┌──────────┐    ┌──────────┐  ┌───────┐ │
-          │  │ orgs     │ ─▶ │ projects │  │ tokens│ │
-          │  └──────────┘    └────┬─────┘  └───────┘ │
-          │                       │                  │
-          │  ┌────────────────────┼──────────────┐   │
-          │  │  per-project: advertisers,        │   │
-          │  │   campaigns, flights, ads,        │   │
-          │  │   creatives, creative_templates,  │   │
-          │  │   sites, zones, taxonomy          │   │
-          │  └───────────────────────────────────┘   │
-          │                                          │
-          │  ┌────────────┐  ┌──────────────────┐    │
-          │  │ ad_library │  │ events_raw       │    │
-          │  │ (org)      │  │ (partitioned)    │    │
-          │  └────────────┘  └──────────────────┘    │
-          │                  ┌──────────────────┐    │
-          │                  │ events_rollup_*  │    │
-          │                  └──────────────────┘    │
-          └──────────────────────────────────────────┘
-```
+After cold load, the loop checks the `knievel.config_version` sequence every
+five seconds. A larger value triggers another full load. Current boundaries:
 
-`events_raw` is **partitioned by date**. Leaf partitions are managed
-in-process by the partition manager (see § 7). The retention default
-is 30 days; older partitions are dropped, not archived. Operators who
-want event history for compliance run a downstream `COPY`-to-warehouse
-job (see `REPORTING.md`).
+- there is no active `PgListener`/LISTEN/NOTIFY connection;
+- there is no incremental diff load;
+- five seconds is a constant, not a config field;
+- management handlers do not call `nextval(config_version)`; and
+- a write therefore remains invisible until an external bump or process cold
+  load.
 
-`events_rollup_hourly` is a leader-rolled aggregate keyed on
-`(project_id, ad_id, hour)` for cheap reporting reads.
+The demo quickstart restarts the server after seeding for this reason.
 
-Detailed RLS rules and the four-rule migration linter contract live in
-`REQUIREMENTS.md` § 7.1.1.
+## Decision flow
 
-## 7. Multi-tenancy
+`POST /v1/projects/{project_id}/decisions` first authenticates and opens a
+reader-level project transaction. It then takes one snapshot pointer and:
 
-Two-level tenancy: **Org → Project**. Every resource is project-
-scoped (or org-scoped for cross-project resources like Ad Library
-items and tokens). RLS is the enforcement floor; the query layer
-enforces it again at every transaction; CI enforces it a third time
-via the cross-tenant manifest gate (`xtask check-cross-tenant`,
-`tests/cross_tenant_manifest.toml`).
+1. resolves `site_id` or `site_url`/alias (not `site_external_id`);
+2. filters active flights and ads by dates, site/zone/ad-type, and blocklists;
+3. keeps the lowest numeric priority tier;
+4. chooses weighted ads without replacement for that placement;
+5. optionally applies the admin-only, project-enabled force path;
+6. builds the typed creative response, rendering Liquid for `templated`; and
+7. signs one payload used under relative `/e/c/...` and `/e/i/...` paths.
 
-Three deployment shapes match different consumer patterns:
+`api.public_base_url` is not consulted by this code. The selection core is pure
+RAM work, but bearer verification/project authorization may touch PostgreSQL.
+Force requests also write an audit row before selection. A successful pick
+composes one decision event; channel saturation makes the decision request
+return 503.
 
-1. **Single-project** — one knievel deployment serves one publisher.
-   Multi-tenancy is unused but the rails are still there. Cheapest
-   to operate; least flexible.
-2. **Project-per-environment** — one knievel deployment per
-   environment (dev/stage/prod), each with its own project. The
-   tenant boundary is the environment boundary.
-3. **Project-per-tenant** — one knievel deployment serves N
-   publishers, each their own project. The default v0 shape; what
-   `MIGRATION_RX.md` documents.
+The explainer follows the same snapshot and force gate but emits no event or
+audit row and uses placeholder tracking paths.
 
-Picking between 2 and 3 is mostly about who owns the project — the
-operator or the tenant. Project tokens can be revoked independently
-in shape 3; in shape 2 the operator owns all tokens.
+## Event, rollup, and partition flow
 
-## 8. Auth at a glance
+[`src/events.rs`](src/events.rs) owns a bounded MPSC channel (default 8192), a
+one-second drain tick, and a 5000-row in-memory batch cap. `flush_batch` does not
+use COPY: it opens one transaction and, for each event, changes the org GUC and
+executes one `INSERT ... ON CONFLICT`. A failed flush logs and drops the whole
+in-memory batch; there is no durable queue.
 
-| Method | When | Token shape | Validates against |
-|---|---|---|---|
-| Opaque bearer (default) | Every API call | `kvl_<env>_<scope>_<short-id>_<secret>` | `knievel.api_tokens` row, argon2id verify on `secret_hash` |
-| JWT (optional) | Every API call | `Authorization: Bearer <jwt>` | JWKS auto-discovered from `iss` + `claim_mapping` config |
-| K8s SA token | JWT mode special case | Standard projected SA token | Cluster's OpenID provider (or an inline JWKS endpoint) |
-| HMAC URL sig | `/e/i/*` and `/e/c/*` | Path-embedded | Current signing secret + 8 h previous-secret overlap window |
-| Anonymous | `/healthz`, `/readyz`, `/version`, `/openapi.json` | n/a | n/a |
+Event kinds are `0=decision`, `1=impression`, and `2=click`. The uniqueness
+constraint includes `ts`, so replay dedup is timestamp-sensitive; see
+[REPORTING.md](REPORTING.md).
 
-`AUTH.md` covers the full surface — claim-mapping config, role
-matrix, K8s integration recipe, signing-secret rotation procedure.
+The advisory-lock leader starts two hourly loops:
 
-## 9. Observability stack
+- [`src/rollup.rs`](src/rollup.rs) aggregates fully settled hours under the
+  loader role into `events_rollup`, replacing counts on conflict and advancing
+  a watermark in the same transaction. Null dimensions become the `0`
+  unattributed sentinel.
+- [`src/partitions.rs`](src/partitions.rs) attempts to pre-create four daily
+  leaves, then detach leaves older than retention. It does not archive or drop
+  detached tables. During 2026, migration `0010`'s already-attached year-wide
+  seed leaf overlaps those daily bounds; the first CREATE fails and the pass
+  returns before reaching its detach sweep.
 
-Three concurrent streams, all carrying the same `request_id` /
-`trace_id`:
+The leader lock uses a connection acquired from the configured pool. Followers
+retry every five seconds. A four-hour watchdog releases a stale leader session;
+that budget is currently a constant.
 
-- **Logs**: structured JSON via `tracing`. Per-request fields:
-  `request_id`, `org_id`, `project_id`, `route`, `status`, `duration_ms`.
-  Handler-internal events get added as nested fields.
-- **Traces**: OpenTelemetry spans exported via OTLP/gRPC.
-  `poem-otel`-style middleware mints the root span; downstream DB,
-  HTTP, and S3 calls inherit. Default sampler is parent-based with a
-  10% root-sample rate.
-- **Errors**: Sentry via `sentry-tower`. Per-request hub keeps
-  fingerprinting per-tenant. Any 5xx from a handler files a Sentry
-  issue; 4xx and timeouts don't.
+## Creative images
 
-Per-tenant data lives in **logs and traces**, not Prometheus —
-Prometheus default-low cardinality is mandatory to keep the
-collector stable. Per-project metrics can be opt-in for an
-investigation via the `metrics.per_tenant_enabled` config block.
+The upload handler validates size, declared/sniffed MIME, and a fixed raster
+allowlist, then writes through `ImageStore`. Server boot always installs
+`InMemoryStore`. Uploads therefore return `memory://` identifiers, disappear on
+restart, and are not replica-shared. Object-storage structs in older designs do
+not select a runtime backend.
 
-`REQUIREMENTS.md` § 10 has the full contract; `DEPLOYMENT.md` § 11
-covers the operator-side wiring.
+## Admin UI trust boundary
 
-## 10. Failure model
+The image includes `web/admin/dist` and defaults
+`KNIEVEL_ADMIN_UI__STATIC_DIR=/var/lib/knievel/admin`. The SPA can authenticate
+through OIDC PKCE or a pasted opaque bearer. `oidc-client-ts` and the fallback
+both use `window.sessionStorage`; OIDC takes precedence when both exist.
 
-Two cross-cutting principles, in order:
+This avoids first-party authentication cookies but makes same-origin script
+execution a bearer compromise. TLS, CSP/reverse-proxy policy, admin reachability,
+and upstream token TTL are operator responsibilities. `require_oidc` hides the
+paste-token path but does not move tokens out of browser storage.
 
-1. **Reads degrade later than writes.** A snapshot that's seconds
-   stale still serves decisions; a Postgres writer outage means
-   POST/PATCH return 503 and the snapshot loader's poll keeps the
-   already-loaded snapshot live.
-2. **Failures surface, not silently drop.** Save: the events
-   channel under saturation, which is intentionally lossy with a
-   `events.dropped` counter — this is a deliberate tradeoff
-   covered in `REQUIREMENTS.md` § 10.9.
+## Observability and health
 
-Other failure modes ranked by visibility (most-visible first):
+Working behavior:
 
-| Failure | Visibility | Behavior |
-|---|---|---|
-| DB writer unreachable | `/readyz` 503; LB drains | Snapshot keeps serving reads; writes 503. |
-| JWKS endpoint unreachable | Per-request 401 with explicit cause | Tokens minted before outage continue working until cache TTL. |
-| S3 unreachable | `/v1/.../image` 503 | Existing creative images still serve; new uploads fail loudly. |
-| Snapshot stale (LISTEN dropped) | `snapshot.staleness_seconds` metric | Poll backstop catches up within 5 s. |
-| Event channel saturated | `events.dropped` metric | Decisions still served; events lost (lossy by design). |
-| Leader miss (advisory lock churn) | `partition.leader_changes` metric | Partitions catch up on next leader's tick (10 min). |
-| Aurora failover | `db.failover` metric (synthetic) | LISTEN drops; reconnect handler re-establishes. |
+- JSON or compact `tracing-subscriber` output;
+- per-request method/path/status/latency/request-id logging;
+- configurable request-log skips and slow threshold;
+- `/healthz` process liveness;
+- `/readyz` DB reachability (or explicit DB-less 200); and
+- `/version` build fields plus effective auth modes/issuer summaries.
 
-`REQUIREMENTS.md` § 10.9 enumerates the chaos rigs that exercise each;
-`DEPLOYMENT.md` § 13 has the runbook links.
+Parsed-but-stubbed behavior:
 
-## 11. Capacity model
+- OTel enablement logs a message but installs no exporter;
+- Sentry enablement logs a message but installs no SDK; and
+- there is no `/metrics` endpoint.
 
-SLO targets — currently **TARGET (unverified)** until the v0.1.0 bench
-lands in `bench/results/v0.1.md`:
+## Deployment and release topology
 
-- **Decision latency**: p50 ≤ 8 ms, p99 ≤ 25 ms, p99.9 ≤ 75 ms (per
-  pod, against a snapshot of ≤ 10k ads).
-- **Decision throughput**: 5k req/s per pod at the SLO above.
-- **Event ingest**: 50k events/s per pod (in-memory channel + every
-  ~1.5 s `COPY` batch).
-- **Snapshot staleness**: ≤ 5 s.
+The runtime [`Dockerfile`](Dockerfile) packages already-built server/CLI
+binaries and admin assets into a distroless non-root image. Local orchestration
+lives in `cargo xtask build-image`; release orchestration lives in
+[`.github/workflows/release.yml`](.github/workflows/release.yml).
 
-Scaling axes:
+Reference runtime manifests are [`examples/compose/`](examples/compose/) and
+[`charts/knievel/`](charts/knievel/). Some chart values are retained because
+existing templates reference them even though the Rust config ignores them;
+[DEPLOYMENT.md](DEPLOYMENT.md) classifies that boundary.
 
-- **Horizontal (pods)**: each pod carries its own snapshot copy and
-  its own event channel. Horizontal scale is linear up to the DB's
-  connection budget. The chart's default budget is 12 connections per
-  pod — see `REQUIREMENTS.md` § 7.8.
-- **Vertical (Postgres)**: writer tier scales with event-write
-  throughput; reader replicas don't help knievel's hot path (RAM
-  snapshot) but help downstream warehouse copies.
-- **Object store**: independent of knievel's tier; use whatever is
-  closest to your serving region.
-
-## 12. Named tradeoffs
-
-One paragraph per substantive design decision:
-
-- **Postgres-only in v0.** No Redis, no Cassandra, no Kafka. The
-  snapshot lives in process memory and recovers from Postgres on
-  boot; events are buffered in a bounded in-process channel and
-  `COPY`'d in batches. This bounds operational complexity dramatically
-  but forces a hard cap on event-rate scaling: when the channel
-  saturates, events drop. The tradeoff is intentional — real-world
-  publishers tolerate the loss far better than they tolerate a
-  second-datastore operational burden.
-- **In-memory snapshot vs. per-request DB lookup.** Decisions touch
-  RAM only. The snapshot trades a 5-second-bounded staleness window
-  for sub-millisecond hot-path reads. Anyone who needs strongly
-  consistent reads should not use knievel for the decision path —
-  there's no API for "force-read the writer DB."
-- **Server-to-server only in v0.** No browser-direct decision endpoint,
-  no CORS-relaxed paths, no public anonymous access except the
-  HMAC-signed event endpoints. A v0 caller is always a server
-  (Rails, Node, Go, …) holding a bearer token that knievel issued.
-  Browser-direct (signed URL or session-cookie) is a real future need
-  but adds an authn surface knievel doesn't ship today.
-- **Opaque tokens AND JWTs both supported.** Operators with K8s
-  service accounts get JWT mode for free; operators without get
-  opaque bearers issued from the management API. Picking just one
-  would force the other group to build a translation layer.
-- **No required Postgres extensions beyond `pgcrypto`.** Aurora,
-  RDS, Supabase, and self-hosted Postgres 14+ all run knievel
-  unchanged. We could squeeze better partitioning ergonomics from
-  `pg_partman` but the dependency would scope us to operators who
-  can install it.
-- **In-process partition manager.** A second daemon (or a `pg_partman`
-  install) would be one more thing to monitor. The advisory-lock
-  leader election + 4-day-look-ahead partitions cover the operational
-  envelope without an extra service.
-- **One workflow per release, not per artifact.** The `release.yml`
-  workflow on `v*` tag does CI, image, CLI binaries, GitHub Release,
-  cosign, and provenance attestation in one DAG. Splitting them
-  across workflows would have been more "modular" but would have
-  multiplied the trigger configuration surface.
-
-## 13. Where to read more
-
-| Topic | Source |
-|---|---|
-| Spec — full system requirements | `REQUIREMENTS.md` |
-| Wire surface — request/response shapes | `API.md` |
-| Auth — token shape, JWT mode, role matrix | `AUTH.md` |
-| Reporting — event schema, rollup tables | `REPORTING.md` |
-| Operator guide — install, sizing, runbooks | `DEPLOYMENT.md` |
-| Test plan — slice naming, CI gate matrix | `TESTING.md` |
-| Live progress — what's done, what's next | `PHASES.md` |
-| Per-consumer migration recipe (RX) | `MIGRATION_RX.md` |
-| Cross-session contributor primer | `CLAUDE.md` |
-
-The platform contract is the four files at the top
-(`REQUIREMENTS.md`, `API.md`, `AUTH.md`, `REPORTING.md`). Everything
-else is supporting material.
+A tag release builds two native image platforms, three CLI archive targets, an
+OCI Helm package, a GitHub Release, and a regenerated external Ruby client. See
+[CODEMAP.md](CODEMAP.md) for the DAG and generated-file owners.

@@ -1,0 +1,12 @@
+[advisories]
+ignore = [
+    # poem-openapi enables Poem's quick-xml 0.36.2 integration, but Knievel
+    # exposes no XML routes. Remove both exceptions before adding any XML
+    # route, or when poem-openapi permits a fixed quick-xml release (>=0.41).
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    # rsa 0.9.10 is lock-only through inactive sqlx-mysql; this build enables
+    # PostgreSQL only, so rsa is not compiled or reachable. Remove this
+    # exception before enabling MySQL, or when SQLx no longer locks this RSA.
+    "RUSTSEC-2023-0071",
+]

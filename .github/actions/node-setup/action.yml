@@ -1,35 +1,35 @@
 name: 'node-setup'
 description: >-
-  Install pnpm + Node pinned to web/admin's expectations and warm
-  the pnpm store cache. The CALLER must run `actions/checkout@v4`
-  before invoking this composite — local composite actions
-  (`./.github/actions/...`) can't be located until the repo is on
-  disk. Mirrors `rust-setup` (gotcha #6 in CLAUDE.md).
+  Install the supported Node release and the exact pnpm version declared by
+  web/admin, restore the pnpm store, and install frozen dependencies. The
+  caller must check out the repository before invoking this local action.
 
 inputs:
   node-version:
-    description: 'Node major version (matches web/admin/package.json engines.node)'
+    description: 'Supported Node major (matches web/admin/package.json engines.node)'
     required: false
     default: '22'
   pnpm-version:
-    description: 'pnpm version (matches web/admin/package.json packageManager)'
+    description: 'Exact pnpm version (matches web/admin/package.json packageManager)'
     required: false
-    default: '10'
+    default: '10.33.0'
 
 runs:
   using: 'composite'
   steps:
-    - uses: pnpm/action-setup@v4
+    - name: Install pnpm
+      uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
       with:
         version: ${{ inputs.pnpm-version }}
 
-    - uses: actions/setup-node@v4
+    - name: Install Node and restore pnpm cache
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
       with:
         node-version: ${{ inputs.node-version }}
         cache: 'pnpm'
         cache-dependency-path: 'web/admin/pnpm-lock.yaml'
 
-    - name: pnpm install (web/admin)
+    - name: Install web/admin dependencies
       shell: bash
       working-directory: web/admin
       run: pnpm install --frozen-lockfile

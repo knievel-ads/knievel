@@ -2,120 +2,52 @@ name: nightly
 
 on:
   schedule:
-    - cron: '13 7 * * *'   # 07:13 UTC, post-US-PT, low-collision slot
+    - cron: '13 7 * * *'
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: nightly-${{ github.workflow }}
   cancel-in-progress: false
 
-env:
-  CARGO_TERM_COLOR: always
-
-# Advisory only. Failures open issues per TESTING.md §12.8 but do
-# not block tags. Each job activates in the phase that earns it.
+# This workflow currently covers only browser and bundle checks. The nine
+# chaos_* files are ignored skeletons with no fault-injection harness, so this
+# workflow deliberately makes no chaos, fuzz, benchmark, or Postgres-matrix
+# coverage claim.
 
 jobs:
-  chaos:
-    name: chaos suite
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: knievel_app
-          POSTGRES_PASSWORD: dev
-          POSTGRES_DB: knievel
-        options: >-
-          --health-cmd "pg_isready -U knievel_app -d knievel"
-          --health-interval 2s
-          --health-timeout 2s
-          --health-retries 30
-        ports:
-          - 5432:5432
-    env:
-      DATABASE_URL: postgres://knievel_app:dev@localhost:5432/knievel
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/rust-setup
-      - uses: taiki-e/install-action@nextest
-      # Run every chaos_* binary. Today the bodies are #[ignore]'d
-      # skeletons (Phase 4.7); flipping #[ignore] activates a
-      # scenario without changing this workflow. Use
-      # --run-ignored=all so nightly exercises the bodies once
-      # they're filled in, while per-PR runs (which never invoke
-      # this job) keep the ignored-by-default behavior.
-      - name: Run chaos suite
-        run: |
-          cargo nextest run --workspace --locked \
-            -E 'kind(test) & binary(/^chaos_/)' \
-            --no-tests=pass \
-            --run-ignored=all \
-            --no-fail-fast || true
-          # `|| true` keeps the job from failing the nightly run
-          # while skeletons are still empty; remove once the first
-          # scenario is wired and the suite is meaningful.
-
-  fuzz:
-    name: cargo fuzz (60 min budget per target)
-    runs-on: ubuntu-latest
-    if: false   # Phases 3.9 (HMAC) / 3.15 (JWT) activate
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [hmac, jwt, decisions]
-    steps:
-      - uses: actions/checkout@v4
-      - run: echo "TODO — Phases 3.9 / 3.15 — cargo fuzz on ${{ matrix.target }}"
-
-  criterion:
-    name: criterion benchmarks vs main
-    runs-on: ubuntu-latest
-    if: false   # Phase 3.9 activates (first hot-path code)
-    steps:
-      - uses: actions/checkout@v4
-      - run: echo "TODO — Phase 3.9 — selection + HMAC benches"
-
-  pg-matrix:
-    name: postgres ${{ matrix.pg }}
-    runs-on: ubuntu-latest
-    if: false   # Phase 1.9 activates (once integration suite has rows)
-    strategy:
-      fail-fast: false
-      matrix:
-        pg: ['14', '15', '16']
-    steps:
-      - uses: actions/checkout@v4
-      - run: echo "TODO — Phase 1.9 — multi-Postgres-version integration matrix"
-
   ui-e2e:
-    # Phase 7.10: Playwright e2e against `pnpm preview`. Browser
-    # binaries get installed on demand here (not in per-PR ci.yml)
-    # because they add ~250 MB and aren't worth bloating the
-    # default lane.
     name: ui e2e (Playwright)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/node-setup
       - run: pnpm --dir web/admin exec playwright install --with-deps chromium
       - run: pnpm --dir web/admin build
       - run: pnpm --dir web/admin test:e2e
-      - if: failure()
-        uses: actions/upload-artifact@v4
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: playwright-report
           path: web/admin/playwright-report
+          if-no-files-found: warn
           retention-days: 7
 
   ui-size-limit:
-    # Phase 7.10: bundle-size budgets per UI.md "CI integration."
-    # Runs nightly so a regression doesn't block per-PR
-    # development but DOES open an issue (per TESTING.md §12.8)
-    # if breached.
     name: ui bundle size budgets
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/node-setup
       - run: pnpm --dir web/admin size

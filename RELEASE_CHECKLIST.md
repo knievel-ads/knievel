@@ -1,127 +1,91 @@
 # Release Checklist
 
-This checklist gates every `v*` tag on the platform repo. It's
-enforced by CI as a required PR comment on the release-tagging PR
-(per `TESTING.md` § 10.3) and by the maintainer reviewing the tag.
+Use this checklist in the `release/vX.Y.Z` preparation PR. It is operator
+review material; no workflow parses PR checkboxes today.
 
-The form below is intended to be **pasted into the release PR**.
-Each item is a checkbox; skipping any item requires a brief written
-justification in the same PR.
+> **Current repository prerequisite:** as of 2026-08-20 the repository has no
+> branch protection or ruleset. Do not create a release tag until owners add a
+> ruleset that protects `main`, blocks force pushes, requires the permanently
+> named `CI result` check, and restricts creation/update/deletion of `v*` tags.
+> In-workflow ancestry checks cannot make an attacker-supplied tag workflow
+> trustworthy.
 
----
+## Release `vX.Y.Z`
 
-## Release Checklist for `vX.Y.Z`
+**Releaser:** _@handle_
 
-**Releaser:** _@github-handle_
-**Target tag:** `vX.Y.Z`
 **Previous tag:** `vA.B.C`
-**Release notes anchor:** `CHANGELOG.md` § `[X.Y.Z]`
 
-### Tests + gates
+**Preparation branch:** `release/vX.Y.Z`
 
-- [ ] CI green on the release PR (full per-PR DAG —
-      `.github/workflows/ci.yml`).
-- [ ] **Cross-tenant integration tests pass** — `cargo xtask
-      check-cross-tenant` reports 100% endpoint coverage; every
-      `tests/api_*.rs` cross-tenant case is green.
-- [ ] **Migration linter passes** — `cargo xtask lint-migrations`
-      reports clean.
-- [ ] OpenAPI drift gate green — `cargo xtask openapi --check`.
-- [ ] Doc-table gate green — `cargo xtask check-api-doc` (every
-      endpoint in the spec is documented in `API.md`).
-- [ ] Doc-fence gate green — `cargo xtask check-doc-fences` (every
-      fenced code block parses).
-- [ ] Link-checker green — `lychee` against intra-repo `.md` paths.
-- [ ] Acceptance suite (`tests/acceptance.rs` ACC-01..14) green
-      against the compose stack.
+### Repository controls and source
 
-### Manual review
+- [ ] From a clean, current local `main`,
+      `cargo xtask release-tag X.Y.Z --commit` created `release/vX.Y.Z`,
+      updated/regenerated the release files,
+      and created no tag or remote push.
+- [ ] Protected `main` and restricted `v*` tag rules are active and verified by
+      an owner.
+- [ ] The preparation PR targets `main`, has the required reviews, and `CI
+      result` is successful at the exact merge candidate.
+- [ ] The release commit was merged through the PR; it was not pushed directly.
+- [ ] The intended tag SHA is reachable from current `origin/main`.
+- [ ] No canonical release tag at or above `vX.Y.Z` already exists.
 
-- [ ] **Auth-config or RLS-policy changes** since the previous tag
-      were reviewed by a second maintainer. `git diff vA.B.C..HEAD
-      -- migrations/ src/auth/ src/handlers.rs src/db.rs`.
-- [ ] **No new endpoints accept tenant identity from the request
-      body** — only path-derived or token-derived. (Auditor: scan
-      handlers added since the previous tag for `org_id` /
-      `project_id` in request types.)
-- [ ] **No new logging surfaces PII** — no raw user-agent strings,
-      no IP addresses outside `events_raw`, no JWT contents,
-      no full bearer tokens. (Auditor: scan
-      `src/observability.rs` and any new `tracing::` call sites.)
-- [ ] **Schema migrations are additive** — `git diff vA.B.C..HEAD
-      -- migrations/` shows only `CREATE TABLE`, `ALTER TABLE …
-      ADD COLUMN`, `CREATE INDEX`. No `DROP COLUMN`, no `DROP
-      TABLE` (a column marked deprecated for ≥ 6 months may drop
-      with a justification linking the deprecation commit).
-- [ ] **CLAUDE.md "Open known gaps"** has been re-checked; any
-      gap that closed in this release moves to a CHANGELOG entry.
+### Machine-verifiable preflight
 
-### CHANGELOG + versioning
+- [ ] The tag is exactly `vMAJOR.MINOR.PATCH` with no leading zeros or suffix.
+- [ ] `Cargo.toml` workspace version, every local source-free package in
+      `Cargo.lock`, and `openapi.yaml` `info.version` equal `X.Y.Z`.
+- [ ] `CHANGELOG.md` has a dated `[X.Y.Z]` heading, a canonical release link,
+      and `[Unreleased]` compares from `vX.Y.Z`.
+- [ ] Workspace and package license metadata is `MIT` and a complete top-level
+      `LICENSE` exists. This is mandatory: CLI packaging does not tolerate a
+      missing README or LICENSE.
+- [ ] From a complete clone of merged `main`, create the local annotated tag and
+      run `cargo xtask release-preflight vX.Y.Z` before pushing it.
 
-- [ ] `CHANGELOG.md` `[Unreleased]` section is moved to `[X.Y.Z]`
-      and includes:
-  - Added: every user-facing addition.
-  - Changed: every wire-format-affecting change (with the
-    `REQUIREMENTS.md § 6.4` justification when the change is a
-    deprecation step).
-  - Fixed: every bug fix.
-  - Security: every advisory CVE / GHSA, with credit.
-- [ ] Compatibility matrix is honored:
-  - **Patch (`X.Y.Z` → `X.Y.(Z+1)`):** no spec changes; bug fixes
-    + doc fixes only. Generated gem is regenerated only if the
-    spec materially changed.
-  - **Minor (`X.Y.0` → `X.(Y+1).0`):** spec is additive; gem
-    `X.(Y+1).*` mirrors. Old gem `X.Y.*` continues to work.
-  - **Major (`X.0.0` → `(X+1).0.0`):** breaking change permitted
-    only after the 6-month deprecation window.
-- [ ] `Cargo.toml` workspace `version` matches the target tag.
+### Tests and review
 
-### Release artifacts
+- [ ] `CI result` covers formatting/clippy, unit, Postgres 16 integration/API,
+      xtask linters, OpenAPI, docs, UI, Helm, gem/image smoke, four acceptance
+      shards, Rust 1.94.1, and the non-publishing Apple Silicon smoke.
+- [ ] The observed acceptance inventory is understood: seven active tests and
+      23 ignored scenarios. Green CI does not imply those ignored bodies ran.
+- [ ] The nine `chaos_*` files remain deferred skeletons; nightly claims no
+      chaos coverage.
+- [ ] Auth, tenant/RLS, migration, logging/PII, and compatibility changes since
+      `vA.B.C` received explicit human review.
+- [ ] Changelog entries accurately describe user-facing changes and any
+      deprecation/sunset.
 
-- [ ] `release.yml` workflow ran successfully on the tag (all jobs
-      green: `publish-image` (matrix: amd64 + arm64),
-      `publish-image-merge`, `build-cli`, `github-release`,
-      `release-ruby-gem`). The PR that merged the release commit
-      to `main` already ran the per-PR DAG; the tag workflow does
-      not re-run it (TESTING.md § 12.9).
-- [ ] Container image present: `ghcr.io/knievel-ads/knievel:vX.Y.Z`.
-      Multi-arch (`amd64` + `arm64`).
-- [ ] Image cosigned + provenance-attested. `cosign verify
-      ghcr.io/knievel-ads/knievel@<digest> \
-      --certificate-identity-regexp '…' \
-      --certificate-oidc-issuer-regexp 'https://token.actions.githubusercontent.com'`.
-- [ ] CLI binaries attached to the GitHub Release for all four
-      target triples
-      (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`,
-      `x86_64-apple-darwin`, `aarch64-apple-darwin`), each with a
-      `.sha256` sidecar and a cosign sign-blob bundle.
-- [ ] `release-ruby-gem.yml` workflow ran successfully — gem
-      tagged on `knievel-ruby` and published to RubyGems.
-- [ ] `gem install knievel -v X.Y.Z` succeeds from a clean machine
-      and `require 'knievel'` works.
+### Expected artifacts
 
-### Operator-facing
+- [ ] Multi-architecture image (`linux/amd64`, `linux/arm64`) is available under
+      the canonical raw alias `ghcr.io/knievel-ads/knievel:vX.Y.Z` and the
+      compatibility aliases `:X.Y.Z`, `:X.Y`, and `:X` (plus commit alias).
+- [ ] The merged image digest has a Cosign signature and GitHub artifact
+      attestation.
+- [ ] Exactly three native CLI archives are attached:
+  - `x86_64-unknown-linux-musl`
+  - `aarch64-unknown-linux-musl`
+  - `aarch64-apple-darwin` (minimum macOS 11.0)
+- [ ] Each CLI archive executes with exact output `knievel-cli X.Y.Z`, contains
+      only `knievel-cli`, `README.md`, and `LICENSE`, and has SHA-256 and Cosign
+      sidecars.
+- [ ] Helm chart `X.Y.Z` is present, signed, and pulls successfully.
+- [ ] `knievel-ruby/main` and downstream `vX.Y.Z` advanced atomically; the gem
+      was generated, built, and load-checked before the scoped App token was
+      minted.
+- [ ] Downstream RubyGems publication succeeded and a clean
+      `gem install knievel -v X.Y.Z` loads.
 
-- [ ] `DEPLOYMENT.md` § "Sizing guidance" still reflects reality
-      (or the v0 "TARGET (unverified)" caveat is still honest).
-- [ ] `MIGRATION_RX.md` (and any other consumer migration files)
-      updated for any wire-format changes.
-- [ ] If this release contains a deprecation, it ships with the
-      6-month sunset header (`Deprecation: true`,
-      `Sunset: <RFC-3339-date>`) and a CHANGELOG note.
+### Final warning
 
-### Sign-off
+- [ ] I understand a release rerun is **not idempotent**. Image/GitHub/Helm
+      effects may already exist, and downstream tag reuse fails closed. Never
+      move or force-update either release tag; follow `RELEASE_PLAYBOOK.md`.
 
-- [ ] Releaser: _@github-handle_, _date_
-- [ ] Second-maintainer review on auth/RLS changes (or N/A if no
-      such changes): _@github-handle_, _date_
+**Sign-off:** _@handle, date_
 
----
-
-If any item is **N/A**, replace the checkbox with `~` strikethrough
-and add a one-line note on why the item didn't apply.
-
-If any item is **skipped with justification**, leave the box
-unchecked and add a sub-bullet explaining why. The maintainer
-reviewing the tag is the final authority on whether the
-justification is acceptable.
+**Second reviewer for auth/RLS changes (or N/A):** _@handle, date_

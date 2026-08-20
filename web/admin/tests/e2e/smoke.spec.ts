@@ -29,7 +29,7 @@ test.beforeEach(async ({ page }) => {
 });
 
 test('boots and renders the paste-token login', async ({ page }) => {
-  await page.goto('/');
+  await page.goto('/admin/');
   await expect(page).toHaveURL(/\/login/);
   await expect(page.getByRole('heading', { name: /sign in/i })).toBeVisible();
   await expect(page.getByTestId('paste-token-input')).toBeVisible();
@@ -47,7 +47,7 @@ test('rejects an invalid token with a useful error', async ({ page }) => {
     }),
   );
 
-  await page.goto('/');
+  await page.goto('/admin/');
   await page.getByTestId('paste-token-input').fill('kvl_test_garbage');
   await page.getByRole('button', { name: /sign in/i }).click();
   await expect(page.getByText(/Token rejected/i)).toBeVisible();

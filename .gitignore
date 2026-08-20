@@ -29,6 +29,8 @@ web/admin/.vite/
 web/admin/.tanstack/
 web/admin/*.tsbuildinfo
 web/admin/src/routeTree.gen.ts
+/web/admin/.env*
+!/web/admin/.env.example
 # Playwright outputs (Phase 7.10)
 web/admin/playwright-report/
 web/admin/test-results/

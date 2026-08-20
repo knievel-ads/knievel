@@ -13,6 +13,7 @@
 import { defineConfig, devices } from '@playwright/test';
 
 const BASE_URL = process.env.E2E_BASE_URL ?? 'http://127.0.0.1:4173';
+const ADMIN_URL = new URL('/admin/', BASE_URL).toString();
 
 export default defineConfig({
   testDir: './tests/e2e',
@@ -28,8 +29,8 @@ export default defineConfig({
     // Build is assumed to have run already (CI does
     // `pnpm build` before invoking this config); preview is
     // Vite's static server on :4173.
-    command: 'pnpm preview --port 4173 --strictPort',
-    url: BASE_URL,
+    command: 'pnpm preview --host 127.0.0.1 --port 4173 --strictPort',
+    url: ADMIN_URL,
     reuseExistingServer: !process.env.CI,
     timeout: 60_000,
   },

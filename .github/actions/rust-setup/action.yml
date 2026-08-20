@@ -1,50 +1,51 @@
 name: 'rust-setup'
 description: >-
-  Install the Rust toolchain pinned in rust-toolchain.toml and
-  restore the shared cargo cache. The CALLER must run
-  `actions/checkout@v4` before invoking this composite — local
-  composite actions (`./.github/actions/...`) can't be located
-  until the repo is on disk.
+  Activate the repository toolchain from rust-toolchain.toml, add optional
+  targets, and restore one Swatinem/rust-cache layer. The caller must check
+  out the repository before invoking this local action.
 
 inputs:
   shared-key:
-    description: 'rust-cache shared-key (defaults to knievel-ci so all jobs share)'
+    description: 'rust-cache shared key'
     required: false
     default: 'knievel-ci'
-  components:
-    description: 'Comma-separated extra rustup components'
+  working-directory:
+    description: 'Directory containing rust-toolchain.toml (supports nested checkouts)'
     required: false
-    default: 'rustfmt,clippy'
+    default: '.'
+  workspaces:
+    description: 'Newline-separated rust-cache workspace -> target mappings'
+    required: false
+    default: '. -> target'
+  targets:
+    description: 'Comma-separated rustup target triples to install'
+    required: false
+    default: ''
 
 runs:
   using: 'composite'
   steps:
-    - uses: dtolnay/rust-toolchain@stable
-      with:
-        toolchain: '1.94'
-        components: ${{ inputs.components }}
-
-    - name: Install sccache
-      uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
-      with:
-        version: "v0.15.0"
-
-    - name: Enable sccache (GHA backend) for cargo
+    - name: Activate repository Rust toolchain
       shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        REQUESTED_TARGETS: ${{ inputs.targets }}
       run: |
-        # SCCACHE_GHA_ENABLED routes sccache's store to the GitHub Actions
-        # cache (not ephemeral local disk). RUSTC_WRAPPER is set here in CI
-        # only — deliberately NOT in .cargo/config.toml, so coworkers' local
-        # builds are unaffected. CARGO_INCREMENTAL=0 because sccache cannot
-        # cache incremental builds and silently bypasses otherwise.
-        {
-          echo "SCCACHE_GHA_ENABLED=true"
-          echo "RUSTC_WRAPPER=sccache"
-          echo "CARGO_INCREMENTAL=0"
-        } >> "$GITHUB_ENV"
+        set -euo pipefail
+        # With no CLI toolchain argument, rustup discovers channel,
+        # components, and profile from rust-toolchain.toml. Keeping the version
+        # out of this action leaves that file authoritative.
+        rustup toolchain install --no-self-update
+        rustup show active-toolchain
+        if [[ -n "$REQUESTED_TARGETS" ]]; then
+          IFS=',' read -r -a targets <<< "$REQUESTED_TARGETS"
+          rustup target add "${targets[@]}"
+        fi
+        rustc --version --verbose
 
-    - uses: Swatinem/rust-cache@v2
+    - name: Restore Cargo cache
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         shared-key: ${{ inputs.shared-key }}
+        workspaces: ${{ inputs.workspaces }}
         cache-on-failure: 'true'
-

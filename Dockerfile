@@ -16,15 +16,16 @@
 #   ./knievel-cli              (CLI binary, target arch)
 #   ./web/admin/dist/          (admin SPA bundle)
 #
-# `cargo xtask build-image` stages this layout for you. The CI
-# `publish-image` job stages it inline.
+# `cargo xtask build-image --tag knievel:dev` stages this layout
+# for you. The CI `publish-image` job stages it inline.
 #
 # Runtime base: distroless `cc:nonroot`. `cc` (rather than
 # `static`) because rustls-tls links libgcc_s. `nonroot` provides
 # UID 65532 with no shell, no package manager, and no /etc/passwd
 # that an attacker can append to.
 
-FROM gcr.io/distroless/cc-debian12:nonroot
+# cc-debian12:nonroot multi-arch index, reviewed 2026-08-20.
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:adcd20c7b4c988b73cbfbddb26d2eee574571e6d7c9ffea29b3821e0690efb77
 
 COPY knievel     /usr/local/bin/knievel
 COPY knievel-cli /usr/local/bin/knievel-cli

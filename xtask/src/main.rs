@@ -12,6 +12,7 @@ mod check_doc_fences;
 mod check_snake_case;
 mod lint_migrations;
 mod openapi;
+mod release_preflight;
 mod release_tag;
 mod test_shape;
 mod ui_client;
@@ -50,13 +51,24 @@ enum Cmd {
     CheckApiDoc,
     /// Verify every JSON property name + query parameter in `openapi.yaml` is snake_case.
     CheckSnakeCase,
-    /// Cut a release: bump version, refresh Cargo.lock, roll CHANGELOG, commit, tag.
+    /// Read-only validation of a canonical tag and all release metadata.
+    ReleasePreflight {
+        /// Canonical release tag, e.g. `v0.1.37`.
+        tag: String,
+        /// Fully fetched main ref used for the ancestry check.
+        #[arg(long, default_value = "origin/main")]
+        main_ref: String,
+    },
+    /// Prepare a release branch; never tags or pushes.
     ReleaseTag {
-        /// Target version, e.g. `0.1.7`. Tag is `vX.Y.Z`.
+        /// Target version without `v`, e.g. `0.1.37`.
         version: String,
-        /// Skip the local pre-flight gate run (CI still runs them on PR).
+        /// Skip the local pre-flight gate run (CI still runs them on the PR).
         #[arg(long)]
         skip_gates: bool,
+        /// Commit the generated files locally on the release branch.
+        #[arg(long)]
+        commit: bool,
     },
     /// Generate or check the admin-UI typed client (web/admin/src/api/generated.ts).
     UiClient {
@@ -104,12 +116,17 @@ fn main() -> Result<()> {
         Cmd::CheckDocFences => check_doc_fences::run(),
         Cmd::CheckApiDoc => check_api_doc::run(),
         Cmd::CheckSnakeCase => check_snake_case::run(),
+        Cmd::ReleasePreflight { tag, main_ref } => {
+            release_preflight::run(release_preflight::Args { tag, main_ref })
+        }
         Cmd::ReleaseTag {
             version,
             skip_gates,
+            commit,
         } => release_tag::run(release_tag::Args {
             version,
             skip_gates,
+            commit,
         }),
         Cmd::UiClient { check } => ui_client::run(check),
         Cmd::BuildImage { skip_ui, tag } => build_image::run(build_image::Args { skip_ui, tag }),

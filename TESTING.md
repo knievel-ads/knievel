@@ -19,9 +19,9 @@ answer "what blocks the tag?" without reading code.
    milliseconds. The full suite is parallelizable; `cargo nextest run`
    on a developer laptop completes in under 60 s when the DB harness
    is warm.
-3. **Tenant isolation is verified, not asserted.** §7.1.1 of
-   `REQUIREMENTS.md` specifies three release-blocking gates for
-   tenant isolation. They are implemented here, not aspirational.
+3. **Tenant isolation receives explicit checks.** Database/API tests and
+   `cargo xtask check-cross-tenant` provide useful evidence. They do not make
+   every tenancy claim in this design document automatically true.
 4. **The OpenAPI spec is contract-tested.** Every public endpoint is
    exercised through the same surface generated clients use. Spec
    drift between the binary, `openapi.yaml`, and the generated Ruby
@@ -29,10 +29,8 @@ answer "what blocks the tag?" without reading code.
 5. **Acceptance tests describe user journeys**, not endpoints. The
    suite reads like the rollout shape in `MIGRATION_RX.md`: provision,
    sync, decide, observe.
-6. **Degraded-mode behavior is testable.** The matrix in
-   `REQUIREMENTS.md` §10.9 has a paired test for every row. "We
-   handle a DB writer outage gracefully" is a green check, not a
-   claim in a doc.
+6. **Deferred coverage is named honestly.** Ignored acceptance and chaos
+   skeletons remain visible without being counted as executed behavior.
 
 ## 2. Non-Goals (v0)
 
@@ -41,36 +39,23 @@ answer "what blocks the tag?" without reading code.
   uninteresting.
 - **Mutation testing.** Maybe later (e.g. `cargo-mutants`); not
   release-blocking in v0.
-- **Fuzzing as a CI gate.** We run `cargo fuzz` on the HMAC and JWT
-  validators nightly, but a clean nightly is not a tag prerequisite.
-- **Browser testing.** No admin UI in v0.
+- **Fuzzing.** No fuzz targets or CI lane are active today.
+- **Cross-browser coverage.** Nightly exercises Chromium only.
 - **Cross-cloud E2E.** The acceptance suite runs against
   containerized Postgres; Aurora-specific behaviors (failover, NOTIFY
   drop on leader change) are simulated, not exercised against a real
   cluster.
 
-## 3. Test Pyramid
+## 3. Executed layers
 
-```
-                       ┌───────────────────────────────┐
-                       │ E2E Acceptance (§ 7)          │  ~30 scenarios,
-                       │ docker compose, real HTTP     │   ~5 min CI
-                       ├───────────────────────────────┤
-                       │ API / Contract (§ 6)          │  ~200 tests,
-                       │ poem TestClient + sqlx::test  │   ~60 s CI
-                       ├───────────────────────────────┤
-                       │ Integration (§ 5)             │  ~150 tests,
-                       │ real Postgres, narrow scope   │   ~45 s CI
-                       ├───────────────────────────────┤
-                       │ Unit (§ 4)                    │  ~500 tests,
-                       │ pure Rust, no I/O             │   < 10 s CI
-                       └───────────────────────────────┘
-```
+A test belongs at the lowest layer that can prove the property. Current CI runs
+library/binary unit tests, `integration_*` and `api_*` targets against Postgres
+16, seven active in-process acceptance scenarios, UI checks, and one packaged
+image/gem smoke. Counts and timing vary; this document does not invent fixed
+coverage totals.
 
-A test belongs at the lowest layer that can prove the property. A
-selection-algorithm property is a unit test; a tenant-isolation
-property crosses the auth/handler/DB boundary and lives at the API
-layer; "the calling app's gem can run a real sync" is acceptance.
+The 23 ignored acceptance scenarios and nine ignored chaos skeletons are design
+inventory, not higher layers in an executed pyramid.
 
 ## 4. Unit Tests
 
@@ -358,18 +343,14 @@ Per `REPORTING.md`:
 
 ## 7. E2E Acceptance Suite
 
-Black-box, runs against a real running stack via `docker compose`.
-The harness brings up:
+`tests/acceptance.rs` currently runs in-process through
+`poem::test::TestClient` against the same Postgres 16 service used by the API
+and integration lanes. It is not a black-box compose or packaged-image test.
 
-- `postgres:16`
-- `knievel` (built locally; `auto_migrate: true`)
-- `wiremock` for JWKS (Keycloak + K8s API server stand-ins)
-- `minio` for S3-compatible image upload
-- `otel-collector` (sink-only; sanity-check spans are emitted)
-
-The compose file is the same one shipped in `examples/compose/` for
-operators to use as a reference deployment, with one extra service
-(the test runner). Acceptance is the deployment artifact, exercised.
+The file declares 30 ACC scenarios. The observed split is **7 active**
+(ACC-01, 02, 05, 06, 08, 17, and 30) and **23 `#[ignore]`d** scenarios. Normal
+nextest invocation does not execute those ignored bodies. The table below is
+the intended scenario catalog; it must not be read as 30 implemented checks.
 
 ### 7.1 Scenarios
 
@@ -411,9 +392,11 @@ No reaching into knievel internals.
 | ACC-29 | `knievel_reader` role: can `SELECT` from `knievel.*`, cannot `INSERT` / `UPDATE` / `DELETE`; new tables created by future migrations are reachable via default privileges. | `REPORTING.md` § "Access Pattern" |
 | ACC-30 | OpenAPI spec served at `/openapi.json` matches the committed `openapi.yaml`; `/version` carries the documented `auth` block (no secrets). | `API.md` § 5, `AUTH.md` § "Effective-policy visibility" |
 
-Acceptance scenarios run sequentially in a single compose-up to keep
-the per-PR cost bounded. Adding a 31st scenario should cost roughly
-2–4 s of CI time.
+CI partitions the discovered `acceptance` target across four nextest
+count shards. Today that partitions the seven active tests; the 23 ignored
+tests remain ignored. `cargo xtask test-shape` reports this split but proves
+only target classification and discoverability, not behavior or ignored-test
+execution.
 
 ### 7.2 Generated-client smoke pass
 
@@ -489,23 +472,15 @@ identical source on identical rustc. That's what lets
 
 ## 9. Chaos / Degraded-Mode Suite
 
-A separate suite (`tests/chaos/`) that runs nightly and on demand,
-not on every PR. Built on the same compose harness as § 7.
+There is **no executable chaos suite today**. Nine top-level
+`tests/chaos_*.rs` files document the intended degraded-mode scenarios, but
+each contains one ignored skeleton and `tests/chaos/` has no injection harness.
+CI and nightly intentionally select none of them.
 
-| Failure | Injected via | Asserted behavior |
-|---|---|---|
-| DB writer unreachable | `iptables` drop rule on the Postgres container's port 5432 | Decisions continue from snapshot; writes return `503 db_writer_unreachable`; metrics + Sentry breadcrumb emitted |
-| LISTEN connection drops | Force-close the loader's connection in Postgres | Snapshot loader reconnects with backoff; poll backstop catches any divergence within 5 s |
-| NOTIFY queue overflow | Spam `pg_notify` from a side connection | Loader handles the dropped notifies; poll backstop reconciles |
-| Aurora failover (simulated) | Restart the Postgres container | Loader reconnects to "writer"; advisory lock released and re-acquired by another pod within 30 s |
-| Event channel saturation | Throttle flusher with `tc qdisc` to 0 bandwidth | Decision endpoint returns `503 event_channel_saturated`; channel never silently drops |
-| JWKS unreachable | Block egress to wiremock | Cached keys serve until TTL; `kid` cache miss → 401 for that issuer; other issuers unaffected |
-| Connection pool exhaustion | Hold all pool connections in test code | Endpoints return `503 db_pool_exhausted`; `/healthz` and `/metrics` still 200 |
-| Leader watchdog miss | Pause the leader's process for `watchdog_hours + 1` | Process exits non-zero; another pod takes leadership; `/readyz` reports the watchdog state during the gap |
-| Image upload mid-flight failure | Kill MinIO during a multi-part upload | Client gets 5xx; no partial creative row is committed |
-
-Every row of `REQUIREMENTS.md` § 10.9 is paired with a chaos test
-here. New degraded-mode rows require a paired test before merging.
+`cargo xtask test-shape` accepts `chaos_*` only as a deferred class and fails if
+any scenario silently loses `#[ignore]` before a real selector and harness are
+added. This is bookkeeping, not chaos coverage. See `tests/chaos/README.md` for
+the activation contract and `REQUIREMENTS.md` § 10.9 for intended behavior.
 
 ## 10. Security Tests
 
@@ -524,21 +499,20 @@ cover every failure mode:
 | `05_table_outside_knievel.sql` | accept — `public.something` is not knievel's concern |
 | `06_clean_table.sql` | accept — RLS, FORCE, and tenant-bound policy all present |
 
-The linter is unit-tested separately and called from CI on every
-push.
+The linter is unit-tested separately and called by every `ci.yml` trigger.
 
 ### 10.2 Cross-tenant API tests
 
-§ 6.5 and § 7 ACC-17. Both layers required: the API tests cover
-endpoint coverage, the acceptance test covers the realistic deployment.
+§ 6.5 and active ACC-17 provide two in-process layers. The API tests cover
+endpoint cases; ACC-17 covers a user-journey-shaped path. Neither is a packaged
+deployment test.
 
-### 10.3 Release security checklist (release-blocking)
+### 10.3 Release security checklist
 
-`REQUIREMENTS.md` § 7.1.1 gate (3). The checklist lives in
-`RELEASE_CHECKLIST.md` (created at the same time as this doc). The
-release-tagging PR template auto-renders the checklist; CI fails the
-PR if any unchecked item lacks a written justification in the PR
-body.
+The operator checklist lives in `RELEASE_CHECKLIST.md`. It is reviewed in the
+release-preparation PR; there is currently no PR-template or workflow enforcer
+for checkboxes. The tag workflow instead fails closed on machine-verifiable
+ancestry, version, changelog, OpenAPI, Cargo lock, and MIT LICENSE invariants.
 
 The checklist items map to:
 
@@ -546,31 +520,21 @@ The checklist items map to:
 - §10.1 green → "Migration linter passes."
 - A diff of `auth/*` and migrations since the last tag, with a
   maintainer's signoff comment in the PR.
-- A grep over the diff for handler signatures that take `org_id` /
-  `project_id` from `Json<…>` bodies (rejected automatically by a CI
-  step: tenant identity must come from path or token).
-- A grep over the diff for new logging calls, gated against an
-  allowlist of fields. Raw user agents, IP addresses outside
-  `events_raw`, and JWT contents fail the gate.
+- Manual review of handler signatures that take `org_id` / `project_id`
+  from `Json<…>` bodies; tenant identity must come from path or token.
+- Manual review of new logging calls for raw user agents, IP addresses outside
+  `events_raw`, JWT contents, and bearer tokens.
 
 ### 10.4 Auth boot lint
 
-§ 6.6 covers the unit-level cases. A small acceptance scenario
-(part of §7 ACC-30) confirms the binary refuses to start with a
-malformed config and exits with the documented structured error.
+§ 6.6 covers the current unit-level cases. Active ACC-30 checks OpenAPI and
+version behavior; it does not test malformed-config process exit.
 
-### 10.5 Fuzzing (nightly, not release-blocking)
+### 10.5 Fuzzing (deferred)
 
-- `cargo fuzz` against `hmac::verify` — must not panic on any byte
-  string up to 4 KiB.
-- `cargo fuzz` against `auth::jwt::validate` — must not panic on any
-  byte string up to 16 KiB.
-- `cargo fuzz` against the OpenAPI request-body decoders for the
-  decision endpoint and `:batchUpsert` — must not panic; must always
-  produce a 4xx for invalid input, never a 5xx.
-
-Failed fuzz finds are filed as issues; clean fuzzing is not a tag
-prerequisite, but a known panic on a fuzz-discovered input is.
+No fuzz targets or fuzz workflow lane are active. HMAC, JWT, and request-body
+fuzzing remain candidate future work and must not be counted as current nightly
+coverage.
 
 ## 11. Test Data and Fixtures
 
@@ -610,336 +574,143 @@ declared schemas.
 
 ## 12. CI Pipeline and Gates
 
-The CI provider is **GitHub Actions**. Three workflow files:
+GitHub Actions owns three workflows:
 
-- `.github/workflows/ci.yml` — per-PR, required.
-- `.github/workflows/nightly.yml` — scheduled, advisory.
-- `.github/workflows/release.yml` — on `v*` tag, required.
+- `ci.yml`: `pull_request`, pushes to `main`, and `workflow_dispatch`;
+- `nightly.yml`: daily at 07:13 UTC and `workflow_dispatch`;
+- `release.yml`: tag pushes matching `v*` only.
 
-Runners are GitHub-hosted `ubuntu-latest` by default. Self-hosted
-runners are an operator choice; jobs are written so a runner swap
-is a one-line `runs-on:` change. A composite action at
-`.github/actions/rust-setup/` handles the `checkout` + `toolchain`
-+ `rust-cache` boilerplate so every job stays a few lines.
+Workflow permissions default to `contents: read`; publishing jobs elevate only
+the permissions they need. Every checkout disables credential persistence and
+every job has a bounded timeout. x64 Linux uses `ubuntu-24.04`, Linux arm64
+packaging uses native `ubuntu-24.04-arm`, and Apple Silicon uses native
+`macos-15` with `MACOSX_DEPLOYMENT_TARGET=11.0`.
 
 ### 12.1 Concurrency
 
-```yaml
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-```
+CI cancels superseded runs for the same ref. Nightly does not cancel in flight.
+Release uses one repository-wide, non-cancelling `release` group so two tags
+cannot race floating image aliases or downstream `main`.
 
-Force-pushes and rapid re-pushes cancel in-flight runs. The release
-workflow opts out (`cancel-in-progress: false`) — a tag build, once
-started, runs to completion.
+### 12.2 Rust toolchain and caching
 
-### 12.2 Cargo caching
+`rust-toolchain.toml` is the normal-toolchain authority. The local
+`rust-setup` composite activates it, optionally adds target triples, supports
+nested workspace/target mappings, and restores one pinned
+`Swatinem/rust-cache` layer. There is no sccache wrapper and no repository CI
+override of incremental compilation. A separate lane checks the explicit Rust
+1.94.1 MSRV.
 
-A single shared cache slot per workflow, populated once by a primer
-job and read by every downstream job. The action of record is
-[`Swatinem/rust-cache@v2`](https://github.com/Swatinem/rust-cache):
+### 12.3 Reproducible non-Rust tooling
 
-```yaml
-- uses: Swatinem/rust-cache@v2
-  with:
-    shared-key: knievel-ci
-    cache-on-failure: true
-```
+Node application tests use Node 22 and pnpm 10.33.0. Helm is v3.21.4,
+kubeconform is v0.8.0 with a checked release SHA-256, and both Kubernetes schema
+catalog URLs name immutable commits. OpenAPI Generator v7.24.0 and the
+distroless runtime base are selected by multi-architecture image index digest.
+External actions use reviewed full commit SHAs. The local image wrapper's
+canonical syntax is `cargo xtask build-image --tag knievel:dev`.
 
-Caches `~/.cargo/registry`, `~/.cargo/git`, and `target/` keyed on
-`Cargo.lock` + `rustc -V` + the workflow file content. Across jobs
-in the same workflow run, downstream jobs restore from the GHA
-cache backend that `prime` populated rather than rebuilding.
+### 12.4 CI DAG
 
-The **`prime` job** runs first and pays the compile cost once:
+`prime` runs formatting, clippy, test compilation, and benchmark compilation.
+The required fan-out covers unit/property, Postgres integration, API contract,
+xtask linters, documentation links, OpenAPI drift, UI drift/type/lint/test/build,
+Helm/kubeconform, gem build plus compose smoke, four acceptance shards, Rust
+1.94.1, and a non-publishing Apple Silicon CLI smoke.
 
-```yaml
-prime:
-  runs-on: ubuntu-latest
-  steps:
-    - uses: ./.github/actions/rust-setup
-    - run: cargo fmt --all --check
-    - run: cargo clippy --all-targets --locked -- -D warnings
-    - run: cargo nextest run --no-run --all-targets --locked
-```
-
-`fmt` and `clippy` ride along — they need the same dep graph and
-pay no extra wall-clock once `target/` is warm. Subsequent test
-jobs `needs: prime`, restore the same cache, and run only their
-slice.
-
-`sccache` is intentionally not used: with `rust-cache` plus a primer
-job, the marginal speedup doesn't justify the extra moving piece.
-
-The single shared cache slot means a `Cargo.toml` change invalidates
-everything at once — but that's correct, and `prime` absorbs the
-hit so test jobs stay fast. A per-job `target/` slot would
-parallelize the cold path but cost ~2 GB of cache per job, blowing
-past GitHub's 10 GB per-repo cache cap fast.
-
-### 12.3 Docker layer caching
-
-The acceptance suite needs the knievel container image. A
-`build-image` job builds once per workflow run with `docker/buildx`
-backed by the GitHub Actions layer-cache backend:
-
-```yaml
-- uses: docker/build-push-action@v5
-  with:
-    context: .
-    tags: knievel:ci
-    cache-from: type=gha,scope=knievel
-    cache-to:   type=gha,scope=knievel,mode=max
-    outputs:    type=docker,dest=/tmp/knievel-image.tar
-- uses: actions/upload-artifact@v4
-  with: { name: knievel-image, path: /tmp/knievel-image.tar }
-```
-
-Acceptance shards download the artifact and `docker load` it —
-no registry round-trip, no pull-rate-limit risk on `ubuntu-latest`,
-and the same image is exercised by every shard.
-
-### 12.4 Per-PR DAG
-
-```
-                              ┌─────────────────┐
-                              │ prime           │  cargo build, fmt, clippy
-                              │ (warm target/)  │  cache populated
-                              └────────┬────────┘
-                                       │
-        ┌──────────┬──────────┬────────┼────────┬──────────┬─────────────┐
-        ▼          ▼          ▼        ▼        ▼          ▼             ▼
-   unit-prop   db-integ   api-contract   xtask-lints   openapi-drift   helm-lint
-   (no DB)    (pg svc)    (pg svc)       (mig+xtenant) (spec match)    (kubeconform)
-        │          │          │            │            │                │
-        └──────────┴──────────┴────────────┴────────────┴────────────────┘
-                                       │
-                              ┌────────▼────────┐
-                              │ build-image     │  buildx + GHA layer cache
-                              └────────┬────────┘
-                                       │
-                              ┌────────▼────────┐
-                              │ acceptance      │  matrix: shard 1..4
-                              │ (compose)       │  ACC-01..30 partitioned
-                              └────────┬────────┘
-                                       │
-                              ┌────────▼────────┐
-                              │ gem-smoke       │  ruby + RSpec subset
-                              └─────────────────┘
-```
-
-The fan-out after `prime` is the wall-clock floor. With a warm
-cache, every middle-row job finishes in under 90 s. Cold cache
-(e.g. a `Cargo.lock` change) costs `prime` ~5 min and downstream
-jobs add another ~30 s on top.
+The permanently named **`CI result`** job uses `if: always()` and fails unless
+every listed lane reports `success`; failed or dependency-skipped lanes cannot
+be hidden behind a green aggregate. Repository settings currently have no
+branch protection or ruleset, so these jobs are **not claimed as required
+checks**. Owners must create a ruleset requiring `CI result` before relying on
+it as a merge boundary.
 
 ### 12.5 Test slicing
 
-Test files follow a naming convention so a single `nextest` filter
-expression maps cleanly to a CI shard:
+Top-level targets map as follows:
 
-| Slice | nextest filter | Postgres service? |
+| Class | nextest selector | Service |
 |---|---|---|
-| `unit-prop`     | `-E 'kind(lib) + kind(bin) + binary(unit)'`        | no |
-| `db-integ`      | `-E 'kind(test) & binary(integration)'`            | yes |
-| `api-contract`  | `-E 'kind(test) & binary(api)'`                    | yes |
-| `acceptance`    | `-E 'kind(test) & binary(acceptance)'`             | compose stack |
+| library/binary unit | `kind(lib) + kind(bin)` | none |
+| `integration_*` | `kind(test) & binary(/^integration_/)` | Postgres 16 |
+| `api_*` | `kind(test) & binary(/^api_/)` | Postgres 16 |
+| `acceptance.rs` | `kind(test) & binary(acceptance)` | Postgres 16 |
+| `chaos_*` | none (explicitly deferred) | none |
 
-A `cargo xtask test-shape` check fails CI if a test lands outside
-the expected naming. Slices stay stable as the suite grows — no
-editing the workflow when a new test file lands.
-
-The `db-integ` and `api-contract` jobs declare a Postgres service
-container:
-
-```yaml
-services:
-  postgres:
-    image: postgres:16
-    env:
-      POSTGRES_USER:     knievel_app
-      POSTGRES_PASSWORD: dev
-      POSTGRES_DB:       knievel
-    options: >-
-      --health-cmd pg_isready --health-interval 2s
-      --health-timeout 2s --health-retries 30
-```
+`cargo xtask test-shape` rejects unknown top-level targets, missing active
+selectors, a nightly chaos selector, or a non-ignored chaos skeleton. It proves
+classification/discoverability only. It does not run ignored tests, assess
+tenancy safety, or establish meaningful chaos coverage.
 
 ### 12.6 Acceptance sharding
 
-ACC-01..30 (§ 7) runs across an N=4 matrix, partitioned by nextest:
+Four `count:N/4` nextest shards run `acceptance.rs`. The observed source split
+is seven active and 23 ignored, so the shards cover only those seven active
+tests. They use in-process Poem endpoints and Postgres 16, not a packaged image.
+The separate gem smoke builds the runtime image and exercises compose.
 
-```yaml
-acceptance:
-  needs: build-image
-  strategy:
-    fail-fast: false
-    matrix:
-      shard: [1, 2, 3, 4]
-  runs-on: ubuntu-latest
-  steps:
-    - uses: ./.github/actions/rust-setup
-    - uses: actions/download-artifact@v4
-      with: { name: knievel-image, path: /tmp }
-    - run:  docker load -i /tmp/knievel-image.tar
-    - run: |
-        docker compose -f tests/acceptance/compose.yaml \
-          -p knievel-acc-${{ matrix.shard }} \
-          up -d --wait
-    - run: |
-        cargo nextest run \
-          --partition count:${{ matrix.shard }}/4 \
-          -E 'kind(test) & binary(acceptance)'
-```
+### 12.7 Postgres support exercised by CI
 
-Each shard runs under its own compose project name so docker
-network and port collisions are impossible. Total acceptance wall
-time drops from ~5 min single-threaded to ~90 s sharded.
-`fail-fast: false` keeps the diagnostic value of "shards 1 and 3
-failed" rather than cancelling on the first red.
-
-4 is the sweet spot on `ubuntu-latest`. Going higher spends more
-time on compose-up than on tests.
-
-### 12.7 Per-PR gates (required)
-
-| Stage | Gate | Job |
-|---|---|---|
-| `cargo fmt --check` | Required | `prime` |
-| `cargo clippy -- -D warnings` | Required | `prime` |
-| `cargo nextest run` (unit + integration + API) | Required | `unit-prop`, `db-integ`, `api-contract` |
-| `cargo xtask lint-migrations` | Required | `xtask-lints` |
-| `cargo xtask check-cross-tenant` | Required | `xtask-lints` |
-| `cargo xtask test-shape` | Required | `xtask-lints` |
-| `cargo xtask openapi --check` | Required (binary ↔ `openapi.yaml`) | `openapi-drift` |
-| OpenAPI 3.1 meta-schema validation | Required | `openapi-drift` |
-| Acceptance suite (4 shards) | Required, all shards green | `acceptance` |
-| Generated-gem smoke pass | Required | `gem-smoke` |
-| Helm chart `helm lint` + `kubeconform` | Required | `helm-lint` |
-| Release-checklist enforcer (release-tagging PRs only) | Required | `release.yml` |
-
-GitHub branch protection requires every required job. `prime` is
-not directly gated — its failures surface via the `fmt` / `clippy`
-/ build-failure rows downstream; making it required would
-double-count.
+All database CI lanes use Postgres 16 only. There is no inactive 14/15 matrix
+and no claim that CI proves multi-version support. The service image is selected
+by a reviewed Postgres 16 multi-architecture digest.
 
 ### 12.8 Nightly (advisory)
 
-`.github/workflows/nightly.yml`, scheduled `cron: '13 7 * * *'`
-(low-collision time, post-US-PT). Reuses the same `prime` +
-`shared-key` cache strategy.
+Nightly currently runs Playwright UI e2e and UI bundle-size budgets. It does not
+run chaos, fuzzing, Criterion, or a Postgres version matrix. Nightly failures are
+visible workflow failures; there is no automated issue-opening lane.
 
-| Stage | Behavior on failure |
-|---|---|
-| Chaos suite (`tests/chaos/`, § 9) | Open issue via `peter-evans/create-issue-from-file`; page `#knievel-oncall` |
-| `cargo fuzz` (60 min budget per target: hmac, jwt, decisions) | Open issue with the offending input |
-| `criterion` benchmark vs. last main | Open issue if any metric regresses > 30 % |
-| Multi-Postgres-version matrix (14, 15, 16) | Open issue |
+### 12.9 Tag release boundary
 
-A failed nightly does not block tags. § 8 and § 10.5 spell out
-which of these are tag prerequisites when the underlying code path
-changes.
+Before compiling or executing repository code, `release.yml` fetches complete
+`main` and tag history and performs a read-only data check. It accepts only
+canonical `vMAJOR.MINOR.PATCH` tags without leading zeros, requires the commit
+to be on `origin/main`, requires a version newer than every prior canonical
+tag, and checks Cargo workspace/local lock packages, OpenAPI, changelog heading
+and links, and consistent MIT metadata plus a top-level `LICENSE`.
 
-### 12.9 Release-tagging workflow
+Every image, CLI, GitHub Release, Helm, attestation, and downstream Ruby path
+depends on that preflight. This is defense in depth, not a substitute for
+repository controls: **no main or tag ruleset exists today**. Owners must protect
+`main`, require `CI result`, block force pushes, and restrict `v*` tag creation
+before the first release under this workflow. A malicious tag can otherwise
+supply its own workflow and bypass in-file checks.
 
-`.github/workflows/release.yml`, triggered on `push` to tags
-matching `v*`. **Trusts the `main` gate.** The PR that landed the
-tagged commit already ran the per-PR DAG (§ 12.4) green; branch
-protection on `main` makes that a hard precondition. Re-running
-clippy / unit / db / api / acceptance / gem-build+smoke / helm-lint
-/ doc-link / ui-{typecheck,lint,test,build} on the tag commit is
-deterministic with `--locked` deps and yields ~zero additional
-signal at ~25 min wall-time. So the tag workflow only does what
-is intrinsically tag-specific:
-
-1. **Bench regression check.** `bench/results/<version>.md` must be
-   present for any release that touches `selection::*` /
-   `snapshot::*` / `events::flusher::*`. Fails the workflow on a
-   missing artifact, or on a > 20 % regression vs. the previous
-   release on (p50, p99, sustained QPS), unless an explicit waiver
-   appears in the tag's release notes.
-2. **Release security checklist enforcer** (§ 10.3). Fails on any
-   unchecked item without a written justification in the release
-   notes.
-3. **Container image build.** Multi-arch `docker buildx` for
-   `amd64` + `arm64`, signed with `cosign`, pushed to
-   `ghcr.io/knievel-ads/knievel:<version>` and `:latest`.
-4. **Helm chart packaged** and published to the chart's index.
-5. **Ruby gem rebuilt** from the released spec, version bumped to
-   match the spec version, pushed to RubyGems.
-6. **GitHub Release** created with the changelog and artifact links.
-
-If a tag commit needs verification in isolation (e.g. you suspect
-the merge-vs-tag SHA chain was broken by a force-push), run
-`gh workflow run ci.yml --ref <tag>` manually — `ci.yml` accepts
-arbitrary refs.
-
-Release jobs do not run with `cancel-in-progress`. A retried tag
-creates a new run; partial publishes are documented in
-`RELEASE_PLAYBOOK.md` (separate runbook, not part of this spec).
-
-Manual acceptance — a maintainer running the compose stack against
-a fresh dev DB and walking ACC-01..30 visually — is captured as a
-short note in the release-tagging PR. Green CI is what blocks
-merge; the manual pass is belt-and-suspenders.
+Release reruns are not generally idempotent. GHCR uploads or a GitHub Release
+may already exist, and the downstream Ruby tag intentionally refuses reuse.
+Use `RELEASE_PLAYBOOK.md`; never move or overwrite a published tag.
 
 ### 12.10 Workflow file layout
 
 ```
 .github/
-├── workflows/
-│   ├── ci.yml         # per-PR (12.4 – 12.7)
-│   ├── nightly.yml    # 12.8
-│   └── release.yml    # 12.9
+├── workflows/{ci,nightly,release}.yml
 └── actions/
-    └── rust-setup/    # composite: checkout + toolchain + rust-cache
-        └── action.yml
+    ├── node-setup/action.yml
+    └── rust-setup/action.yml
 ```
-
-Keeping the composite action under `.github/actions/` (vs.
-publishing it) means CI doesn't depend on a `marketplace` dance for
-a repo-internal helper. Updates ride along with workflow PRs.
 
 ## 13. Coverage Policy
 
-- **No global percentage target.** A line-coverage minimum dropped
-  on the build is a coverage-as-target antipattern.
-- **Module floors** for the modules where coverage is meaningful:
-  - `selection::*`: 90 %, branch coverage included.
-  - `auth::*`: 90 %, branch coverage included.
-  - `hmac::*`: 95 %.
-  - `migrations::lint`: every documented rule has a fixture (binary
-    coverage rather than line).
-  - `partitions::*`: 80 %, with the leader-election state machine at
-    100 % branch.
-- **Generated code, derived impls, error-conversion boilerplate:** no
-  target.
-
-A `cargo llvm-cov` report is uploaded as a CI artifact for inspection
-but does not block merge. Floors are enforced as discrete tests
-("the algorithm-level test for X exists") rather than a percentage
-gate, so a regression manifests as a missing test, not a percentage
-drift.
+There is no percentage threshold and no `cargo llvm-cov` workflow artifact.
+Coverage is reviewed through concrete tests and the explicit gaps in §§ 7, 9,
+and 15. Adding a skeleton or selector does not count as behavioral coverage.
 
 ## 14. Local Developer Workflow
 
-```
-cargo nextest run                 # unit + integration + API, ~60 s
-cargo xtask lint-migrations       # migration linter
-cargo xtask check-cross-tenant    # endpoint-coverage gate
-cargo xtask openapi --check       # spec drift gate
-just acceptance                   # compose-up + acceptance, ~5 min
+```sh
+cargo test --workspace --locked
+cargo xtask lint-migrations
+cargo xtask check-cross-tenant
+cargo xtask test-shape
+cargo xtask openapi --check
+pnpm --dir web/admin test --run
 ```
 
-`just` recipes wrap the compose harness so contributors don't memorize
-flags. `just acceptance-one ACC-12` runs a single scenario, useful
-when iterating on Ad Library reference resolution or partition
-maintenance without paying for the full pass.
-
-`just watch` runs `cargo nextest run` on every save with the DB
-harness kept warm; first run pays the migration cost, subsequent
-runs reuse the template DB.
+Database-backed targets need a reachable Postgres 16 and the same
+`DATABASE_URL`/role provisioning used in `ci.yml`. There are no `just
+acceptance` or watch recipes in this repository today.
 
 ## 15. What Tests Don't Catch
 

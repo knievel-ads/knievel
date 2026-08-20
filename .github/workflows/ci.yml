@@ -1,15 +1,13 @@
-name: ci
+name: CI
 
 on:
   pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
 
-# Branch protection on `main` requires this DAG to pass before any
-# PR can merge, so re-running the full matrix on the merge commit
-# itself adds ~zero signal at the cost of ~25 min of runner time.
-# `release.yml` makes the same trade explicitly (its own docstring
-# trusts the PR gate); we mirror that here. If you ever need to
-# verify a `main` HEAD in isolation, run
-# `gh workflow run ci.yml --ref main` manually.
+permissions:
+  contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -18,52 +16,56 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
-# DAG defined in TESTING.md §12.4. Many jobs carry `if: false` until
-# the phase that activates them lands; remove the guard in that
-# phase's commit.
-
 jobs:
   prime:
     name: prime
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/rust-setup
-      - uses: taiki-e/install-action@nextest
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        with:
+          tool: cargo-nextest@0.9.143
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      # `--all-targets` would include benches; nextest then tries
-      # to enumerate the bench binary's "tests" by running it,
-      # which fails for benches whose `main()` prints non-nextest
-      # output (e.g. the dhat_decision bench's DHAT_JSON_*
-      # framing). Compile the benches separately so the priming
-      # is still complete, but keep them out of nextest discovery.
-      - run: cargo nextest run --no-run --workspace --lib --bins --tests --examples --locked
-      - run: cargo build --workspace --benches --locked
-      - name: sccache stats
-        if: always()
-        run: sccache --show-stats
+      - name: Compile test targets
+        run: cargo nextest run --no-run --workspace --lib --bins --tests --examples --locked
+      - name: Compile benchmarks separately
+        run: cargo build --workspace --benches --locked
 
   unit-prop:
     name: unit + property
     needs: prime
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/rust-setup
-      - uses: taiki-e/install-action@nextest
-      - run: |
-          cargo nextest run --workspace --locked \
-            -E 'kind(lib) + kind(bin)' \
-            --no-tests=pass
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        with:
+          tool: cargo-nextest@0.9.143
+      - run: >-
+          cargo nextest run --workspace --locked
+          -E 'kind(lib) + kind(bin)'
+          --no-tests=pass
 
   db-integ:
-    name: integration (Postgres)
+    name: integration (Postgres 16)
     needs: prime
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     services:
       postgres:
-        image: postgres:16
+        image: postgres:16@sha256:e17e86066e5ef83e0952a9347f5c792b7ece00972e2aa787a6986f471b3dd3d5
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -73,44 +75,41 @@ jobs:
           --health-interval 2s
           --health-timeout 2s
           --health-retries 30
-        ports:
-          - 5432:5432
+        ports: ['5432:5432']
     env:
       DATABASE_URL: postgres://knievel_app:dev@localhost:5432/knievel
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/rust-setup
-      - uses: taiki-e/install-action@nextest
-      - name: Provision knievel_app (NOSUPERUSER) for RLS-honest tests
-        # Postgres 16.13 rejects ALTER ROLE-self-NOSUPERUSER even
-        # for verified superusers (rolsuper=true, is_superuser=on)
-        # — see PHASES.md follow-up note below for the diagnostic.
-        # Workaround: use `postgres` as the bootstrap superuser
-        # and create knievel_app as NOSUPERUSER from the start.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: Provision non-superuser test role
         run: |
-          PGPASSWORD=postgres psql -h localhost -U postgres -d knievel <<'EOSQL'
+          PGPASSWORD=postgres psql -h localhost -U postgres -d knievel <<'SQL'
             CREATE ROLE knievel_app WITH NOSUPERUSER CREATEDB LOGIN PASSWORD 'dev';
             GRANT ALL PRIVILEGES ON DATABASE knievel TO knievel_app;
             GRANT ALL PRIVILEGES ON SCHEMA public TO knievel_app;
-            -- BYPASSRLS background-loader role (snapshot loader / rollup).
-            -- Created here as the bootstrap superuser since only a
-            -- superuser can grant BYPASSRLS; testlib's ephemerals then
-            -- grant it per-DB SELECTs. The request path never assumes it.
             DO $$ BEGIN CREATE ROLE knievel_loader NOLOGIN BYPASSRLS; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
             GRANT knievel_loader TO knievel_app;
-          EOSQL
-      - run: |
-          cargo nextest run --workspace --locked \
-            -E 'kind(test) & binary(/^integration/)' \
-            --no-tests=pass
+          SQL
+      - run: >-
+          cargo nextest run --workspace --locked
+          -E 'kind(test) & binary(/^integration_/)'
+          --no-tests=pass
 
   api-contract:
-    name: api / contract
+    name: api / contract (Postgres 16)
     needs: prime
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     services:
       postgres:
-        image: postgres:16
+        image: postgres:16@sha256:e17e86066e5ef83e0952a9347f5c792b7ece00972e2aa787a6986f471b3dd3d5
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -120,38 +119,43 @@ jobs:
           --health-interval 2s
           --health-timeout 2s
           --health-retries 30
-        ports:
-          - 5432:5432
+        ports: ['5432:5432']
     env:
       DATABASE_URL: postgres://knievel_app:dev@localhost:5432/knievel
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/rust-setup
-      - uses: taiki-e/install-action@nextest
-      - name: Provision knievel_app (NOSUPERUSER) for RLS-honest tests
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: Provision non-superuser test role
         run: |
-          PGPASSWORD=postgres psql -h localhost -U postgres -d knievel <<'EOSQL'
+          PGPASSWORD=postgres psql -h localhost -U postgres -d knievel <<'SQL'
             CREATE ROLE knievel_app WITH NOSUPERUSER CREATEDB LOGIN PASSWORD 'dev';
             GRANT ALL PRIVILEGES ON DATABASE knievel TO knievel_app;
             GRANT ALL PRIVILEGES ON SCHEMA public TO knievel_app;
-            -- BYPASSRLS background-loader role (snapshot loader / rollup).
-            -- Created here as the bootstrap superuser since only a
-            -- superuser can grant BYPASSRLS; testlib's ephemerals then
-            -- grant it per-DB SELECTs. The request path never assumes it.
             DO $$ BEGIN CREATE ROLE knievel_loader NOLOGIN BYPASSRLS; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
             GRANT knievel_loader TO knievel_app;
-          EOSQL
-      - run: |
-          cargo nextest run --workspace --locked \
-            -E 'kind(test) & binary(/^api/)' \
-            --no-tests=pass
+          SQL
+      - run: >-
+          cargo nextest run --workspace --locked
+          -E 'kind(test) & binary(/^api_/)'
+          --no-tests=pass
 
   xtask-lints:
     name: xtask linters
     needs: prime
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/rust-setup
       - run: cargo xtask lint-migrations
       - run: cargo xtask check-cross-tenant
@@ -161,17 +165,19 @@ jobs:
       - run: cargo xtask check-snake-case
 
   doc-links:
-    # Phase 5.6 — intra-repo link checking via lychee. External
-    # URLs are checked nightly only (rate-limited APIs make
-    # per-PR hostile); intra-repo paths run per PR. See
-    # `DOCUMENTATION_PLAN.md` § 11.2.
     name: doc link check (lychee)
     needs: prime
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: lycheeverse/lychee-action@v2
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - name: Check repository links
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          lycheeVersion: v0.24.2
           args: >-
             --offline
             --no-progress
@@ -182,25 +188,26 @@ jobs:
   openapi-drift:
     name: openapi drift
     needs: prime
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/rust-setup
       - run: cargo xtask openapi --check
-
-  # Admin-UI gates (Phase 7.3). Each job sets up Node + pnpm
-  # via the local node-setup composite (caller checks out
-  # first, mirrors gotcha #6). Path-filtering happens at
-  # repo scope via `paths-filter` would add cycle complexity;
-  # for now every PR runs them — the pnpm-store cache hit
-  # makes a no-op run cheap.
 
   ui-client-drift:
     name: ui client drift
     needs: prime
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/rust-setup
       - uses: ./.github/actions/node-setup
       - run: cargo xtask ui-client --check
@@ -208,18 +215,26 @@ jobs:
   ui-typecheck:
     name: ui typecheck
     needs: prime
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/node-setup
       - run: pnpm --dir web/admin typecheck
 
   ui-lint:
     name: ui lint
     needs: prime
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/node-setup
       - run: pnpm --dir web/admin lint
       - run: pnpm --dir web/admin format:check
@@ -227,42 +242,60 @@ jobs:
   ui-test:
     name: ui test
     needs: prime
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/node-setup
       - run: pnpm --dir web/admin test --run
 
   ui-build:
     name: ui build
     needs: prime
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/node-setup
       - run: pnpm --dir web/admin build
 
   helm-lint:
     name: helm lint + kubeconform
     needs: prime
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
     steps:
-      - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          version: v3.16.2
-      - name: Install kubeconform
+          persist-credentials: false
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.21.4
+      - name: Install verified kubeconform v0.8.0
+        env:
+          KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
         run: |
-          curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
-            | tar -xz -C /usr/local/bin kubeconform
-      - name: helm lint
-        run: helm lint charts/knievel
-      # Render with every optional toggle on so kubeconform sees
-      # the Ingress + ServiceMonitor branches too. The OCI CRD
-      # catalog provides the ServiceMonitor schema since it isn't
-      # in the default Kubernetes schema set.
-      - name: helm template + kubeconform
+          set -euo pipefail
+          archive="$RUNNER_TEMP/kubeconform-linux-amd64.tar.gz"
+          curl --proto '=https' --tlsv1.2 --retry 3 --fail --silent --show-error --location \
+            https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz \
+            --output "$archive"
+          echo "$KUBECONFORM_SHA256  $archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP" kubeconform
+          sudo install -m 0755 "$RUNNER_TEMP/kubeconform" /usr/local/bin/kubeconform
+          kubeconform -v
+      - run: helm lint charts/knievel
+      - name: Render and validate every optional chart branch
         run: |
+          set -euo pipefail
           helm template knievel charts/knievel \
             --set database.host=aurora.example.com \
             --set database.name=knievel \
@@ -272,309 +305,140 @@ jobs:
             --set 'ingress.hosts[0].paths[0].path=/' \
             --set 'ingress.hosts[0].paths[0].pathType=Prefix' \
             --set serviceMonitor.enabled=true \
-            > /tmp/knievel-rendered.yaml
+            > "$RUNNER_TEMP/knievel-rendered.yaml"
           kubeconform -strict -kubernetes-version 1.30.0 \
-            -schema-location default \
-            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
-            -summary /tmp/knievel-rendered.yaml
-
-  # Note: `build-image` (Phase 4.3 PR-time regression guard for the
-  # publish-image flow) was removed in favor of relying on
-  # `gem-build` below. `gem-build` already runs the same cargo +
-  # docker build path on linux/amd64 and then exercises the
-  # resulting image end-to-end via the gem smoke test, so the
-  # signal is a strict superset. Multi-arch publish-by-digest
-  # remains in release.yml.
+            -schema-location 'https://raw.githubusercontent.com/yannh/kubernetes-json-schema/c8f4e61c63bc529749125ac566bccc6986e08d45/{{.NormalizedKubernetesVersion}}-standalone-strict/{{.ResourceKind}}.json' \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/becbe1103d096697610985b89f1630b2ab549982/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            -summary "$RUNNER_TEMP/knievel-rendered.yaml"
 
   gem-build:
-    # Regenerate the knievel-ruby client from this PR's
-    # openapi.yaml, build the gem, and run the end-to-end
-    # `examples/compose/gem_smoke.rb` against a freshly built
-    # knievel docker image. Catches Dockerfile/compose +
-    # openapi-generator + wrapper-code regressions pre-merge so
-    # `release-ruby-gem.yml` has nothing left to discover at tag
-    # time. Mirrors the smoke step previously inlined into the
-    # release workflow.
     name: gem build + smoke
     needs: openapi-drift
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
-      - name: Mint knievel-pipelines installation token
-        id: app-token
-        uses: actions/create-github-app-token@v1
+      - name: Checkout knievel
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          app-id: ${{ secrets.KNIEVEL_PIPELINES_APP_ID }}
-          private-key: ${{ secrets.KNIEVEL_PIPELINES_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: |
-            knievel
-            knievel-ruby
-
-      - name: Checkout knievel (server, for openapi.yaml + config)
-        uses: actions/checkout@v4
-        with:
-          path: knievel
-
-      - name: Checkout knievel-ruby (regeneration target, read-only)
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository_owner }}/knievel-ruby
-          path: knievel-ruby
-          ref: main
-          token: ${{ steps.app-token.outputs.token }}
-          fetch-depth: 1
           persist-credentials: false
-
-      - name: Seed/refresh openapi-generator config in knievel-ruby
+      - name: Clone public knievel-ruby read-only
+        env:
+          DOWNSTREAM: ${{ github.repository_owner }}/knievel-ruby
+        run: git clone --depth 1 --branch main "https://github.com/${DOWNSTREAM}.git" knievel-ruby
+      - name: Seed generator configuration
         run: |
-          set -eu
-          cp knievel/.github/ruby-client/openapi-generator-config.json \
-             knievel-ruby/openapi-generator-config.json
-          cp knievel/.github/ruby-client/.openapi-generator-ignore \
-             knievel-ruby/.openapi-generator-ignore
-
-      - name: Generate Ruby client from openapi.yaml
-        uses: openapi-generators/openapitools-generator-action@v1
+          cp .github/ruby-client/openapi-generator-config.json knievel-ruby/openapi-generator-config.json
+          cp .github/ruby-client/.openapi-generator-ignore knievel-ruby/.openapi-generator-ignore
+      - name: Generate Ruby client with OpenAPI Generator v7.24.0
+        uses: openapi-generators/openapitools-generator-action@b729d184e6b3459572c37c0e37f88a832e69b552 # v1.5.0
         with:
           generator: ruby
+          generator-tag: v7.24.0@sha256:5bf3dc75f764c584da8e3344c51b2f3f1e74703461d46a035b5ac1d31515cc88
           config-file: knievel-ruby/openapi-generator-config.json
-          openapi-file: knievel/openapi.yaml
-          # CI-only placeholder version — never published, never
-          # tagged. Use a non-pre-release semver: a hyphen suffix
-          # like `0.0.0-ci` becomes `0.0.0.pre.ci` in gemspec land,
-          # which `require "knievel/client"` won't auto-activate
-          # because rubygems skips pre-releases by default.
+          openapi-file: openapi.yaml
           command-args: >-
             --additional-properties=gemVersion=999.0.0,library=faraday
             --output=knievel-ruby
-
-      - name: Ensure Gemfile.lock is gitignored
+      - name: Keep generated lockfile untracked
         run: |
-          set -eu
           touch knievel-ruby/.gitignore
-          if ! grep -qx 'Gemfile.lock' knievel-ruby/.gitignore; then
-            echo Gemfile.lock >> knievel-ruby/.gitignore
-          fi
-
+          grep -qxF Gemfile.lock knievel-ruby/.gitignore || echo Gemfile.lock >> knievel-ruby/.gitignore
       - name: Setup Ruby
-        uses: ruby/setup-ruby@v1
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
         with:
-          ruby-version: "3.2"
+          ruby-version: '3.4'
           working-directory: knievel-ruby
           bundler-cache: false
-
-      - name: Build + load-check gem
+      - name: Build and load-check gem
         working-directory: knievel-ruby
         run: |
-          set -eu
+          set -euo pipefail
           bundle config set --local frozen false
           bundle install --jobs=4
           rake build
-          gem_file=$(ls pkg/*.gem | head -n1)
+          gem_file=$(find pkg -maxdepth 1 -name '*.gem' -print -quit)
           test -n "$gem_file"
           unpack_dir=$(mktemp -d)
           gem unpack "$gem_file" --target "$unpack_dir" >/dev/null
-          ruby -I "$unpack_dir"/*/lib -e "require 'knievel'; puts Knievel::VERSION"
-
-      # Admin UI bundle must exist before docker compose build —
-      # the Dockerfile's last stage `COPY web/admin/dist
-      # /var/lib/knievel/admin` is not optional. Mirror Phase 7.11
-      # in release.yml.
-      #
-      # Inline pnpm + node-setup (instead of the
-      # `node-setup` composite) because this job checks knievel
-      # out into `./knievel/`, but the composite's
-      # `cache-dependency-path` is hard-coded to
-      # `web/admin/pnpm-lock.yaml` relative to the runner's
-      # workspace root.
-      - uses: pnpm/action-setup@v4
+          actual=$(ruby -I "$unpack_dir"/*/lib -e "require 'knievel'; print Knievel::VERSION")
+          test "$actual" = '999.0.0'
+      - uses: ./.github/actions/node-setup
+      - run: pnpm --dir web/admin build
+      - uses: ./.github/actions/rust-setup
         with:
-          version: "10"
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: pnpm
-          cache-dependency-path: knievel/web/admin/pnpm-lock.yaml
-      - name: pnpm install (web/admin)
-        working-directory: knievel/web/admin
-        run: pnpm install --frozen-lockfile
-      - name: Build admin UI bundle
-        working-directory: knievel/web/admin
-        run: pnpm build
-
-      # The runtime Dockerfile is thin (just COPYs pre-built
-      # binaries in), so we cargo-build natively here, then
-      # stage the binaries + admin bundle and run a plain
-      # `docker build`. Mirrors release.yml's publish-image.
-      #
-      # rust-setup composite isn't usable here — this job checks
-      # knievel out into `./knievel/`, not the workspace root —
-      # so we inline the toolchain + cache like the pnpm setup
-      # above does for the same reason.
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: '1.94'
-
-      # Inline equivalents of the rust-setup composite's sccache
-      # steps (same reason as above: composite path unavailable
-      # with the subdirectory checkout). Same pinned SHA + version.
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
-        with:
-          version: "v0.15.0"
-
-      - name: Enable sccache (GHA backend) for cargo
-        run: |
-          {
-            echo "SCCACHE_GHA_ENABLED=true"
-            echo "RUSTC_WRAPPER=sccache"
-            echo "CARGO_INCREMENTAL=0"
-          } >> "$GITHUB_ENV"
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: knievel
           shared-key: knievel-gem-build
-          cache-on-failure: 'true'
-
-      - name: Build knievel + knievel-cli (native release)
-        working-directory: knievel
+      - name: Build native release binaries
         run: |
+          set -euo pipefail
           cargo build --release --locked --bin knievel --bin knievel-cli
           strip target/release/knievel target/release/knievel-cli
-
-      - name: Stage docker build context
-        working-directory: knievel
+      - name: Stage Docker context
         run: |
-          set -eu
+          set -euo pipefail
           mkdir -p docker-context/web/admin
-          cp target/release/knievel       docker-context/knievel
-          cp target/release/knievel-cli   docker-context/knievel-cli
-          cp -r web/admin/dist            docker-context/web/admin/dist
-          cp Dockerfile                   docker-context/Dockerfile
-
-      - name: Build local knievel docker image
-        working-directory: knievel
-        run: docker build -t knievel:gem-smoke docker-context
-
-      - name: Boot compose stack (postgres + knievel only)
-        working-directory: knievel
+          install -m 0755 target/release/knievel docker-context/knievel
+          install -m 0755 target/release/knievel-cli docker-context/knievel-cli
+          cp -R web/admin/dist docker-context/web/admin/dist
+          cp Dockerfile docker-context/Dockerfile
+      - name: Build local image
+        run: docker build --tag knievel:gem-smoke docker-context
+      - name: Boot Postgres and knievel
         env:
           KNIEVEL_IMAGE: knievel:gem-smoke
         run: |
-          set -eu
-          # seed-demo runs as the distroless `nonroot` UID (65532)
-          # and writes the token to ./tmp/knievel-dev-token via a
-          # bind mount. The runner workspace owner is `runner`
-          # (UID 1001), so we have to pre-create the directory
-          # with permissive perms — otherwise the seeder fails
-          # with EACCES.
+          set -euo pipefail
           mkdir -p tmp
           chmod 0777 tmp
-          # Boot postgres + knievel WITHOUT knievel-seed. seed-demo
-          # depends only on postgres being healthy, but it can race
-          # ahead of knievel server's `auto_migrate: true` and hit
-          # "relation knievel.X does not exist" intermittently. We
-          # run seed-demo as a one-shot AFTER /healthz proves
-          # migrations are complete (next step but one).
-          docker compose -f examples/compose/compose.yaml up -d \
-            knievel-postgres knievel
-
-      # If anything between Boot and Smoke trips, dump every
-      # service's logs before teardown so the failure shows up in
-      # the workflow log instead of vanishing with the runner.
-      - name: Dump compose logs on failure
-        if: failure()
-        working-directory: knievel
-        run: docker compose -f examples/compose/compose.yaml logs --no-color || true
-
-      - name: Wait for /healthz (proves auto_migrate is complete)
-        working-directory: knievel
+          docker compose -f examples/compose/compose.yaml up -d knievel-postgres knievel
+      - name: Wait for migrations and health
         run: |
-          set -eu
+          set -euo pipefail
           deadline=$((SECONDS + 90))
-          until curl -fsS http://localhost:8080/healthz >/dev/null 2>&1; do
-            if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "knievel /healthz never came up" >&2
-              docker compose -f examples/compose/compose.yaml logs knievel >&2
+          until curl --fail --silent --show-error http://localhost:8080/healthz >/dev/null; do
+            if (( SECONDS >= deadline )); then
+              echo 'knievel /healthz never came up' >&2
               exit 1
             fi
             sleep 2
           done
-
-      - name: Run seed-demo (one-shot, post-migration)
-        working-directory: knievel
+      - name: Seed deterministic demo
         env:
           KNIEVEL_IMAGE: knievel:gem-smoke
-        run: |
-          set -eu
-          # `compose run --rm` runs the service synchronously and
-          # tears the container down on exit. Migrations are
-          # already in (proved by /healthz), so this is a single
-          # deterministic run — no restart loop, no race.
-          docker compose -f examples/compose/compose.yaml run --rm knievel-seed
-
+        run: docker compose -f examples/compose/compose.yaml run --rm knievel-seed
       - name: Capture seed token
-        working-directory: knievel
         run: |
-          set -eu
-          # seed-demo writes the file as the distroless `nonroot`
-          # UID (65532) with mode 0o600. The runner user (1001)
-          # cannot read that, and `$(cat ...)` failure inside a
-          # variable assignment does not propagate out under
-          # `set -eu`, so without the chmod we'd silently end up
-          # with an empty bearer and the gem's first call would
-          # 401. Loosen perms with sudo (passwordless on
-          # GitHub-hosted runners), then require the captured
-          # value to be non-empty.
+          set -euo pipefail
           test -s tmp/knievel-dev-token
           sudo chmod 0644 tmp/knievel-dev-token
-          token=$(cat tmp/knievel-dev-token)
+          token=$(<tmp/knievel-dev-token)
           test -n "$token"
           echo "KNIEVEL_TOKEN=$token" >> "$GITHUB_ENV"
-
-      - name: Install built gem + run end-to-end smoke
-        working-directory: knievel
+      - name: Run smoke against unpacked built gem
         run: |
-          set -eu
-          gem install --no-document ../knievel-ruby/pkg/*.gem
-          ruby examples/compose/gem_smoke.rb
-
-      # Always-on log dump so failures in the smoke step (which
-      # runs after compose is already up) don't lose server +
-      # seeder context. The earlier `if: failure()` step only
-      # triggers on failures BEFORE smoke (e.g. boot-time
-      # postgres crashes).
-      - name: Dump full compose logs (always)
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/knievel-gem"
+          gem unpack knievel-ruby/pkg/*.gem --target "$RUNNER_TEMP/knievel-gem" >/dev/null
+          ruby -I "$RUNNER_TEMP"/knievel-gem/*/lib examples/compose/gem_smoke.rb
+      - name: Dump compose logs
         if: always()
-        working-directory: knievel
-        run: docker compose -f examples/compose/compose.yaml logs --no-color || true
-
-      - name: Compose teardown (always)
+        continue-on-error: true
+        run: docker compose -f examples/compose/compose.yaml logs --no-color
+      - name: Tear down compose stack
         if: always()
-        working-directory: knievel
-        run: docker compose -f examples/compose/compose.yaml down -v
+        run: docker compose -f examples/compose/compose.yaml down --volumes
 
   acceptance:
-    # ACC-01..30 partitioned across 4 nextest shards per
-    # `TESTING.md` § 12.6. The binary runs in-process via
-    # `poem::test::TestClient` against an ephemeral Postgres for
-    # each test (Phase 4.5), so the docker-image artifact dance
-    # described in TESTING.md isn't needed today; the spec's
-    # `build-image` predecessor is satisfied by the existing
-    # `Dockerfile` + Phase 4.3 image-publish workflows. Going
-    # in-process keeps the shard wall-time at ~30 s per shard.
     name: acceptance shard ${{ matrix.shard }}/4
     needs: prime
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
         shard: [1, 2, 3, 4]
     services:
       postgres:
-        image: postgres:16
+        image: postgres:16@sha256:e17e86066e5ef83e0952a9347f5c792b7ece00972e2aa787a6986f471b3dd3d5
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -584,30 +448,100 @@ jobs:
           --health-interval 2s
           --health-timeout 2s
           --health-retries 30
-        ports:
-          - 5432:5432
+        ports: ['5432:5432']
     env:
       DATABASE_URL: postgres://knievel_app:dev@localhost:5432/knievel
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/rust-setup
-      - uses: taiki-e/install-action@nextest
-      - name: Provision knievel_app (NOSUPERUSER) for RLS-honest tests
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: Provision non-superuser test role
         run: |
-          PGPASSWORD=postgres psql -h localhost -U postgres -d knievel <<'EOSQL'
+          PGPASSWORD=postgres psql -h localhost -U postgres -d knievel <<'SQL'
             CREATE ROLE knievel_app WITH NOSUPERUSER CREATEDB LOGIN PASSWORD 'dev';
             GRANT ALL PRIVILEGES ON DATABASE knievel TO knievel_app;
             GRANT ALL PRIVILEGES ON SCHEMA public TO knievel_app;
-            -- BYPASSRLS background-loader role (snapshot loader / rollup).
-            -- Created here as the bootstrap superuser since only a
-            -- superuser can grant BYPASSRLS; testlib's ephemerals then
-            -- grant it per-DB SELECTs. The request path never assumes it.
             DO $$ BEGIN CREATE ROLE knievel_loader NOLOGIN BYPASSRLS; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
             GRANT knievel_loader TO knievel_app;
-          EOSQL
-      - name: Run shard ${{ matrix.shard }}/4
+          SQL
+      - name: Run acceptance shard
+        run: >-
+          cargo nextest run --workspace --locked
+          -E 'kind(test) & binary(acceptance)'
+          --partition count:${{ matrix.shard }}/4
+          --no-tests=pass
+
+  msrv:
+    name: Rust 1.94.1 MSRV
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install exact MSRV
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable, 2026-08-05
+        with:
+          toolchain: 1.94.1
+      - run: cargo +1.94.1 check --workspace --all-targets --locked
+
+  macos-smoke:
+    name: macOS Apple Silicon CLI smoke
+    runs-on: macos-15
+    timeout-minutes: 35
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-setup
+        with:
+          shared-key: knievel-macos-smoke
+      - name: Build and inspect CLI
         run: |
-          cargo nextest run --workspace --locked \
-            -E 'kind(test) & binary(acceptance)' \
-            --partition count:${{ matrix.shard }}/4 \
-            --no-tests=pass
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          cargo build --release --locked --bin knievel-cli
+          version=$(awk -F '"' '/^version[[:space:]]*=/{print $2; exit}' Cargo.toml)
+          test "$(target/release/knievel-cli --version)" = "knievel-cli $version"
+          minos=$(otool -l target/release/knievel-cli | awk '/minos/{print $2; exit}')
+          test "$minos" = '11.0'
+
+  result:
+    name: CI result
+    if: ${{ always() }}
+    needs:
+      - prime
+      - unit-prop
+      - db-integ
+      - api-contract
+      - xtask-lints
+      - doc-links
+      - openapi-drift
+      - ui-client-drift
+      - ui-typecheck
+      - ui-lint
+      - ui-test
+      - ui-build
+      - helm-lint
+      - gem-build
+      - acceptance
+      - msrv
+      - macos-smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every CI lane to succeed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          jq --exit-status 'to_entries | all(.value.result == "success")' <<< "$NEEDS_JSON"

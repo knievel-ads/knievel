@@ -1,168 +1,132 @@
 # Release Playbook
 
-What to do when a tag build fails halfway, when a bad release ships,
-or when an operator needs to roll back. Pairs with
-`RELEASE_CHECKLIST.md` (the pre-tag gate) and `DEPLOYMENT.md` § 9
-(rolling restarts during normal upgrades).
+Operational recovery for `.github/workflows/release.yml`. Read
+`RELEASE_CHECKLIST.md` before creating a tag.
 
-This document gets fleshed out over time as real-world incidents
-surface gaps; the sections below are the v0 starting frame.
+## Safety model
 
-## When to use which procedure
+A `v*` push starts one serialized workflow with several irreversible external
+effects: GHCR image aliases, image/chart signatures and attestations, a GitHub
+Release, and an atomic `knievel-ruby/main` + tag push that can trigger RubyGems.
+The workflow is intentionally **not generally idempotent**. A rerun may meet an
+existing Release or tag and fail; it must never overwrite a published tag.
 
-| Situation | Procedure |
-|---|---|
-| Tag pushed; image builds OK; gem regen failed | § 1 — partial-failure recovery |
-| Tag pushed; image + gem out; later found broken | § 2 — yank + patch release |
-| Operator already pulled a bad image and is running it | § 3 — operator-side rollback |
-| Tag pushed but never finished — workflow killed mid-run | § 4 — re-run-on-same-tag |
+The read-only preflight precedes all builds and publishers. It reduces mistakes,
+but protected `main` and restricted `v*` tag rules are the real trust boundary.
+If those owner controls are absent, stop rather than release.
 
-## 1. Partial-failure recovery
+## 1. Triage before retrying
 
-The two release workflows (`release.yml` for image+CLI+GitHub
-Release, `release-ruby-gem.yml` for the gem) run in parallel on
-each `v*` tag. They share no state — one can succeed while the
-other fails. Pattern:
+1. Freeze additional releases; the global `release` concurrency group prevents
+   workflow overlap but does not replace communication.
+2. Inspect each job and record which external effects occurred:
 
-1. **Identify which workflow failed** and at which step.
-   `gh run list --workflow release.yml --limit 5`,
-   `gh run list --workflow release-ruby-gem.yml --limit 5`.
-2. **If `release.yml` (image) failed:**
-   - Image not pushed → fix the cause (build error, ghcr auth,
-     cosign quota), `gh workflow run release.yml --ref vX.Y.Z`.
-     The workflow is idempotent on its core artifacts (the
-     image push uses `--exists=skip`-equivalent semantics; cosign
-     re-signs cleanly).
-   - Image pushed but later steps failed (CLI binaries, GitHub
-     Release) → re-run; the image-push step's idempotency carries.
-3. **If `release-ruby-gem.yml` (gem) failed:**
-   - Generation failed → fix the cause, re-trigger. The workflow
-     refuses to overwrite an existing tag on `knievel-ruby` (see
-     `release-ruby-gem.yml` "Commit + tag knievel-ruby" step), so
-     a partial commit on `knievel-ruby/main` doesn't block re-runs;
-     a partial tag does.
-   - Gem built but `gem push` to RubyGems failed → manually
-     `gem install` the workflow artifact and `gem push` from a
-     trusted machine; record this in the release PR.
-4. **Don't tag a different version** to "try again." Rotate the
-   patch version (`vX.Y.(Z+1)`) only if the failed run actually
-   published an artifact a real consumer might have pulled.
+   ```sh
+   gh run view <run-id> --log
+   gh run view <run-id> --json jobs,url,headSha,headBranch
+   ```
 
-## 2. Yank + patch release
+3. Check immutable/public state directly: GHCR digests and aliases, GitHub
+   Releases/assets, Helm OCI artifact, `knievel-ruby/main` and `vX.Y.Z`, and
+   RubyGems.
+4. Do not assume a red job made no side effect; a network response can be lost
+   after a server accepted a write.
 
-A bad release got out. RubyGems and ghcr behave differently:
+## 2. Failure classes
 
-### RubyGems
+### Preflight failed
 
-`gem yank knievel -v X.Y.Z` removes the version from the index.
-Bundler / `gem install` no longer pulls it; existing installs are
-unaffected. Yanking is reversible (`gem yank --undo`) but treat it
-as final — if you need the version back, cut a new patch.
+No workflow publisher was eligible to start. Fix metadata through a new
+`release/vX.Y.Z` PR. If the rejected tag was already pushed, do not move it;
+choose the next version after the corrected commit is on protected `main`.
+
+A missing or malformed top-level MIT `LICENSE`, off-main SHA, non-monotonic
+version, or Cargo/OpenAPI/changelog mismatch is a hard failure, not a waiver.
+
+### Build failed before upload/push
+
+Fix through a PR and cut the next version. A tag identifies one immutable source
+commit; do not rebuild different source under the same tag.
+
+### Per-architecture image digest exists, manifest job failed
+
+The untagged digest may remain in GHCR. If no public alias or later side effect
+exists, `gh run rerun <run-id> --failed` can retry the failed DAG. Confirm the
+rerun still uses the same tag SHA and review logs for alias/signature conflicts.
+
+### GitHub Release or Helm failed after image publication
+
+The image is already consumable. Prefer a patch release rather than pretending
+the first run was atomic. If retrying a transient failure, use only:
+
+```sh
+gh run rerun <run-id> --failed
+```
+
+There is no `workflow_dispatch` trigger. Before retrying, determine whether the
+failed job partially created its target; GitHub Release and downstream tag
+creation can reject duplicates.
+
+### Downstream Ruby job failed
+
+Generation, bundle install, gem build, and load check occur before any App token
+is minted. The final push advances `knievel-ruby/main` and `vX.Y.Z` atomically,
+so Git cannot leave only one of those refs updated.
+
+- If neither ref moved, a failed-job rerun may be safe after fixing only an
+  external/transient cause.
+- If downstream `vX.Y.Z` exists, the workflow intentionally refuses reuse. Do
+  not delete or move it to make a rerun pass. Verify RubyGems and cut a patch if
+  correction is needed.
+- If RubyGems publication failed after the downstream tag triggered it, recover
+  in the downstream repository according to its trusted publish procedure and
+  record the manual action on the release.
+
+## 3. Bad release: roll forward
+
+Never force-update `vX.Y.Z`, repoint its canonical image alias to different
+bytes, or replace a RubyGems version. Cut `vX.Y.(Z+1)` with the fix and mark the
+bad GitHub Release prominently.
+
+RubyGems can be yanked (existing installs remain):
 
 ```sh
 gem yank knievel -v X.Y.Z
 ```
 
-Then ship a patch release (`vX.Y.(Z+1)`) with the fix and a
-`Security` (or `Fixed`) entry in CHANGELOG that names the yanked
-version explicitly.
+Treat a yank as an incident action and document it in the next changelog.
 
-### Container image
+## 4. Operator rollback
 
-OCI images on ghcr are **immutable by digest** — the bad image
-stays addressable forever via its `sha256:…`. The mutable tag
-(`vX.Y.Z`) can be re-pointed by pushing a corrected image at the
-same tag, but **don't**: it confuses anyone who pulled the old
-digest. Instead:
-
-1. Cut a patch tag `vX.Y.(Z+1)` with the fix.
-2. Push the corrected image at `vX.Y.(Z+1)`.
-3. Re-point the floating `latest` tag to `vX.Y.(Z+1)` (the
-   `release.yml` workflow does this automatically on tag).
-4. Annotate the bad release on the GitHub Releases page with a
-   "DO NOT USE — see `vX.Y.(Z+1)`" notice. Don't delete the bad
-   release.
-
-## 3. Operator-side rollback
-
-An operator who pulled a bad image needs to roll back. The Helm
-chart and the compose manifest both pin by tag (or digest, for
-immutable installs). Procedure:
+Prefer a previously recorded immutable image digest. Tags below are shown only
+for readability.
 
 ```sh
-# Helm:
-helm upgrade knievel oci://ghcr.io/knievel-ads/charts/knievel \
-  --version <previous-good> \
-  --set image.tag=v<previous-good>
-# Or pin a digest for safety:
-helm upgrade knievel oci://… \
-  --set image.repository=ghcr.io/knievel-ads/knievel \
-  --set image.tag=sha256:<previous-good-digest>
-
-# Compose:
+# Compose
 KNIEVEL_IMAGE=ghcr.io/knievel-ads/knievel:v<previous-good> \
   docker compose -f examples/compose/compose.yaml up -d
+
+# Helm chart and application image
+helm upgrade knievel oci://ghcr.io/knievel-ads/charts/knievel \
+  --version <previous-good> \
+  --set image.repository=ghcr.io/knievel-ads/knievel \
+  --set image.tag=v<previous-good>
 ```
 
-The pod rollout takes the standard rolling-restart shape from
-`DEPLOYMENT.md` § 9. The snapshot rebuilds from Postgres on each
-new pod's boot; the events channel buffer drains within ~2 s
-because the flusher's batch interval doesn't change across versions.
-**No data loss for already-buffered events** during the rollback.
+Validate migration compatibility before rollback; additive schema policy does
+not prove an old binary understands every newer migration. Rotate credentials
+if the incident may have exposed HMAC secrets, bearer tokens, App credentials,
+or signing material.
 
-If the rollback is for a security CVE, also rotate any secrets the
-bad version touched (HMAC signing secret, auth-token re-mint if
-the bug exposed token contents).
+## 5. Incident record
 
-## 4. Re-run-on-same-tag
+For any consumer-visible failure:
 
-A workflow killed mid-run (e.g., GitHub Actions runner timeout)
-hasn't published anything user-visible yet. The fix is to re-run
-the workflow:
+1. annotate the bad GitHub Release without deleting history;
+2. link the failed run and exact tag SHA;
+3. list every observed image/chart/gem digest or version;
+4. ship a patch and name the bad version in `CHANGELOG.md`; and
+5. record any manual publish, yank, or rollback with reviewer approval.
 
-```sh
-gh run rerun <run-id> --failed
-# Or, force a fresh run on the same tag:
-gh workflow run release.yml --ref vX.Y.Z
-```
-
-Both `release.yml` and `release-ruby-gem.yml` are designed to be
-re-run-safe on the same tag — the image push is idempotent by
-digest; the gem regen refuses to overwrite an existing
-`knievel-ruby` tag (so a clean re-run requires deleting the
-partial tag from `knievel-ruby` first if the prior run got that
-far).
-
-## 5. Communicating the incident
-
-For any user-visible badness:
-
-1. **Cut a patch release** with the fix per § 1 or § 2.
-2. **Annotate the bad release** on the GitHub Releases page
-   (don't delete it — historical record matters).
-3. **Update CHANGELOG.md** in the next release with a `Security`
-   or `Fixed` entry that explicitly names the bad version.
-4. **Post-mortem** for any incident that affected a real consumer.
-   Living doc — no template yet; add one when the first one
-   ships. Reference: GitHub's blameless post-mortem culture.
-
-## 6. Things that intentionally have no playbook entry
-
-- **Force-push to `main`.** Don't. The harness git-safety rules
-  reject it; `RELEASE_CHECKLIST.md` requires a proper patch tag
-  to fix anything.
-- **`git tag --force` to overwrite an existing tag.** Don't. If a
-  tag is bad, cut the next patch. Existing immutable artifacts
-  (image digests, RubyGems versions) are not in your power to
-  retract once observed.
-- **Roll forward by editing the docker image in-place.** ghcr
-  digests are immutable; this is impossible by design. Cut the
-  next patch instead.
-
-## References
-
-- `RELEASE_CHECKLIST.md` — the gate.
-- `DEPLOYMENT.md` § 9 — normal upgrade rolling-restart flow.
-- `TESTING.md` § 12.9 — the release-tagging workflow contract.
-- `REQUIREMENTS.md` § 6.4 — the additive-forever compatibility
-  policy that constrains what a patch release can do.
+Forbidden recovery shortcuts: direct commits to `main`, force-pushed release
+tags, deleting a downstream tag to permit reuse, and in-place image repair.

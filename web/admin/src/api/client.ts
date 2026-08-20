@@ -93,10 +93,10 @@ const authMiddleware: Middleware = {
 };
 
 export const apiBaseUrl = (): string => {
-  // Same-origin in prod (UI mounted at /admin/, API at /v1/).
-  // Vite dev server proxies via vite.config.ts (proxy is opt-
-  // in via env var; default same-origin still works against
-  // a CORS-enabled API).
+  // Same-origin in production (UI mounted at /admin/, API at
+  // /v1/). Vite's development-only proxy forwards /v1 to
+  // KNIEVEL_ADMIN_API_ORIGIN (http://localhost:8080 by default),
+  // so the browser uses this same empty base URL in both modes.
   return '';
 };
 

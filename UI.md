@@ -28,6 +28,41 @@ for v0 and will be a separate deliverable.
 - An embedded editor for `creative_template.schema` JSON Schema.
   Raw JSON textarea with validation is acceptable for v0.
 
+## Current implementation status
+
+The admin SPA is shipped in the Knievel image and mounted by the
+Poem server at `/admin/`. Vite emits `/admin/` asset URLs and
+TanStack Router uses `/admin` as its history base. With no
+`admin_ui.static_dir`, the same binary remains a headless API and
+does not serve the SPA.
+
+The current bundle includes both supported bearer flows: OIDC
+Authorization Code + PKCE when `/admin/config.json` supplies an
+issuer and public client ID, and a paste-token form that validates
+an opaque `kvl_*` token with `/v1/whoami`. `/admin/login` remains a
+direct paste-token route even when `require_oidc` is true; that
+flag controls presented UI choices, not route-level or API auth
+enforcement. No client secret is used by or belongs in the SPA.
+
+`web/admin/src/api/generated.ts` is checked-in output from
+`openapi.yaml`; `cargo xtask ui-client` regenerates it and
+`cargo xtask ui-client --check` enforces drift in CI. All API calls
+use the generated `openapi-fetch` paths through the same-origin,
+auth-aware client.
+
+Shipped route groups cover the org/project browser, org ad
+library, project demand lists, inventory, templates, taxonomy,
+advertiser creation, creative image upload, and the decision
+tester. The project dashboard, rollup report, and events-tail
+screens still contain explicit placeholders. The report explainer
+route redirects to the tester. Members, tokens, and other Settings
+pages are not implemented route modules.
+
+Nightly Playwright runs against the production Vite preview at the
+real `/admin/` mount, with API requests stubbed for the deterministic
+login smoke. Nightly Size Limit enforces the existing JavaScript and
+CSS budgets.
+
 ## Information architecture
 
 Knievel's resources don't fit a single drill-down tree. There
@@ -53,7 +88,7 @@ tree when that's the natural drill-down. Detail pages
 reconstruct the parent chain from the API and surface it as
 breadcrumbs.
 
-### Rail layout
+### Target rail layout
 
 | Section | Scope | Resources | Backing endpoints |
 |---|---|---|---|
@@ -66,46 +101,52 @@ breadcrumbs.
 
 ### Routes
 
-URLs are **flat per resource within a project** —
-`{resource}/{id}`, not `{advertiser}/{id}/campaigns/{id}/flights/...`.
-Resource IDs are unique within scope, so threading every parent
-through the URL makes deep links unwieldy and breaks when a
-resource moves between parents (reparenting an Ad to a
-different Flight, etc.). Cross-resource filters use query
-strings: `/projects/{p}/flights?campaign={c}`.
+The deployed SPA prefixes every route below with `/admin`. The
+current file-route tree is:
 
 ```
-/                                          → redirect to last org/project
-/orgs/{org_id}                             → org dashboard
-/orgs/{org_id}/projects                    → projects list
-/orgs/{org_id}/members
-/orgs/{org_id}/tokens
-/orgs/{org_id}/library
-/orgs/{org_id}/library/{item_id}
+/                                          → resolve /v1/whoami, then redirect to the org
+/login                                     → direct opaque-token login
+/oidc/login                                → start Authorization Code + PKCE
+/oidc/callback
+/oidc/logout
 
-/orgs/{org_id}/projects/{project_id}       → project dashboard
+/orgs/{org_id}                             → org details and projects list
+/orgs/{org_id}/library                     → org ad-library list + JSON drawer
+/orgs/{org_id}/projects/{project_id}       → project metadata placeholder
 
-  # Demand
-  /advertisers              /advertisers/{advertiser_id}
-  /campaigns                /campaigns/{campaign_id}
-  /flights                  /flights/{flight_id}
-  /ads                      /ads/{ad_id}
-  /creatives                /creatives/{creative_id}
+  # Demand lists
+  /advertisers
+  /advertisers/new                         → create advertiser
+  /campaigns
+  /flights
+  /ads
+  /creatives                               → list + image upload in drawer
 
-  # Inventory
-  /sites                    /sites/{site_id}
-  /zones                    /zones/{zone_id}
+  # Inventory lists
+  /sites
+  /zones
 
   # Config
-  /templates                /templates/{template_id}
-  /taxonomy                 → channels / priorities / ad-types tabs
+  /templates
+  /taxonomy                                → channels / priorities / ad-types tabs
 
-  # Reports (post-7.8 / 7.13)
-  /reports                  → rollup charts
-  /reports/test             → decision tester (live POST /decisions builder)
-  /reports/explain          → decision explainer (POST /decisions:explain)
-  /reports/events           → tail of /events
+  # Reports
+  /reports                                 → placeholder rollup controls
+  /reports/test                            → live decision + explain requests
+  /reports/explain                         → redirect to /reports/test
+  /reports/events                          → placeholder events tail
 ```
+
+Current list views inspect a selected record in a JSON drawer;
+separate resource detail URLs are not implemented. There is no
+`/orgs/{org_id}/projects` route because the org dashboard owns the
+projects list, and there are no Members, Tokens, or other Settings
+route modules yet.
+
+The longer-term URL design remains flat per resource within a
+project (`{resource}/{id}` rather than a full parent chain) when
+standalone detail routes are added.
 
 ### Cmd+K spotlight
 
@@ -135,7 +176,7 @@ shells, same breadcrumbs. Reports (7.8) and OIDC hardening
 | Components | **Mantine v7** (tables, modals, forms, dates) | Batteries-included audit UI primitives. shadcn/ui is the fallback if Mantine bloat becomes a problem. |
 | Tables | **TanStack Table** under Mantine wrappers | Server-side pagination/sort/filter against our cursor envelope. |
 | Lint/format | **eslint** (typescript-eslint, react-hooks) + **prettier** | Match Rust gates' "fail CI on warnings" stance. |
-| Tests | **vitest** + **@testing-library/react**; **Playwright** for end-to-end | Vitest mirrors `cargo test` ergonomics. Playwright runs against a real backend in CI. |
+| Tests | **vitest** + **@testing-library/react**; **Playwright** for end-to-end | Vitest mirrors `cargo test` ergonomics. Nightly Playwright runs the production preview with deterministic API stubs. |
 | Package manager | **pnpm** | Lockfile determinism; faster than npm in CI. |
 
 Hard constraints:
@@ -152,59 +193,38 @@ Hard constraints:
 
 ## Repo layout
 
-In-tree under `web/admin/`. The admin UI moves at the same
-cadence as the OpenAPI surface during Phase 3+; coupling the
-codegen step to the same CI run as `xtask openapi --check`
-catches drift in one place.
+The UI lives under `web/admin/` and moves with the OpenAPI
+surface. The current layout is:
 
 ```
 web/admin/
   package.json
   pnpm-lock.yaml
-  tsconfig.json
+  playwright.config.ts
   vite.config.ts
-  index.html
   src/
     api/
-      generated.ts        # `openapi-typescript` output; checked in
-      client.ts           # `openapi-fetch` instance, auth header
-    auth/
-      AuthProvider.tsx    # `react-oidc-context` <AuthProvider>
-      RequireAuth.tsx
-      PasteTokenLogin.tsx # fallback when oidc.require_oidc is false
-      runtimeConfig.ts    # fetches /admin/config.json on boot
+      generated.ts        # checked-in openapi-typescript output
+      client.ts           # auth-aware openapi-fetch client
+    auth/                  # runtime config, OIDC, paste token, route guard
+    components/            # tables, drawers, workspace shell, upload/mint UI
     routes/
-      __root.tsx
-      orgs/
-        $org_id.tsx                 # org dashboard + rail
-        $org_id.members.tsx
-        $org_id.tokens.tsx
-        $org_id.library.tsx
-        $org_id.library.$item_id.tsx
-        $org_id.projects.tsx
-        $org_id.projects.$project_id.tsx          # project dashboard + rail
-        $org_id.projects.$project_id.advertisers.tsx
-        $org_id.projects.$project_id.advertisers.$advertiser_id.tsx
-        $org_id.projects.$project_id.campaigns.tsx
-        $org_id.projects.$project_id.flights.tsx
-        $org_id.projects.$project_id.ads.tsx
-        $org_id.projects.$project_id.creatives.tsx
-        $org_id.projects.$project_id.sites.tsx
-        $org_id.projects.$project_id.zones.tsx
-        $org_id.projects.$project_id.templates.tsx
-        $org_id.projects.$project_id.taxonomy.tsx
-        $org_id.projects.$project_id.reports.tsx
-        ...                           # detail routes mirror the list routes
-    components/
-      DataTable.tsx       # Mantine + TanStack Table wrapper
-      JsonView.tsx        # read-only JSON inspector for audit
-      ...
+      index.tsx
+      login.tsx
+      oidc.{login,callback,logout}.tsx
+      orgs.$org_id.tsx
+      orgs.$org_id.library.tsx
+      orgs.$org_id.projects.$project_id.tsx
+      orgs.$org_id.projects.$project_id.{resource}.tsx
+      orgs.$org_id.projects.$project_id.reports*.tsx
     main.tsx
-    app.tsx
-  tests/
-    e2e/                  # Playwright specs
+  tests/e2e/smoke.spec.ts
   README.md
 ```
+
+TanStack Router generates the ignored `src/routeTree.gen.ts` from
+those flat route modules. The generated API client is checked in;
+the generated router tree is not.
 
 When/if the UI graduates to its own deploy cadence (post-Phase
 3, once the spec stabilizes and the deploy story diverges),
@@ -214,26 +234,21 @@ run, no version-skew window.
 
 ## OpenAPI codegen
 
-A new xtask subcommand:
+The shipped xtask commands are:
 
 ```bash
 cargo xtask ui-client                # regenerate web/admin/src/api/generated.ts
 cargo xtask ui-client --check        # CI gate: fail if generated.ts is stale
 ```
 
-Implementation (`xtask/src/ui_client.rs`):
+`xtask/src/ui_client.rs` runs the pinned `openapi-typescript`
+from `web/admin/` against `../../openapi.yaml`. Check mode writes
+a fresh client under `target/` and compares it byte-for-byte with
+the committed file.
 
-1. Shell out to `pnpm --dir web/admin exec openapi-typescript
-   ../../openapi.yaml -o src/api/generated.ts`.
-2. In `--check` mode, run the same command into a temp file and
-   `diff` against the committed copy. Mirror
-   `xtask/src/openapi.rs` exactly — same exit-code shape, same
-   error messaging.
-
-Wire `ui-client --check` into `.github/workflows/ci.yml` as a
-peer of `openapi --check`. Both gates share the same Node setup
-step (a new `.github/actions/node-setup/` composite, mirroring
-`rust-setup`).
+`ui-client --check` is wired into `.github/workflows/ci.yml` as a
+peer of `openapi --check`. Both gates use the repository's shared
+Node setup action.
 
 The generated file is **checked in** (not gitignored) for the
 same reason `openapi.yaml` is: it's part of the contract surface
@@ -280,10 +295,13 @@ side.
 
 ### Routes
 
+Under the deployed `/admin` base:
+
 - `/oidc/login` — initiates `signinRedirect()` and returns null.
 - `/oidc/callback` — completes `signinRedirectCallback()`,
   redirects to the deep link the user originally requested.
 - `/oidc/logout` — calls `signoutRedirect()`.
+- `/login` — validates and stores a pasted opaque token.
 
 ### Runtime config (one bundle, multiple envs)
 
@@ -304,11 +322,12 @@ origin:
 }
 ```
 
-The API constructs this payload from the new `admin_ui:` config
-section (planned in Phase 7.4 alongside the
-`StaticFilesEndpoint` mount; see `AUTH.md` "Knievel-side
-configuration"). Empty `oidc.issuer` means OIDC is disabled and
-the UI falls through to the paste-a-token form.
+The API constructs this public payload from the shipped
+`admin_ui:` config section. It registers the endpoint before the
+`StaticFilesEndpoint` mount so a bundle file cannot shadow it;
+see `AUTH.md` "Knievel-side configuration." OIDC is enabled only
+when both `oidc.issuer` and `oidc.client_id` are non-empty.
+Otherwise protected routes fall through to the paste-token form.
 
 ### Paste-a-token fallback
 
@@ -326,12 +345,19 @@ hack:
 - **CI smoke tests** — deterministic credential, no IdP
   dependency.
 
-The fallback is hidden when `admin_ui.oidc.require_oidc: true`
-(default in prod). The form accepts a `kvl_*` token, validates
-it against a "who am I" endpoint, and stores it in
-`sessionStorage` exactly as the JWT path does. From the API's
-perspective the request is identical to any other Bearer call;
-the UI just constructs the header from a different source.
+The form accepts a `kvl_*` token, validates it against
+`GET /v1/whoami`, and stores it in `sessionStorage` exactly as
+the JWT path does. From the API's perspective the request is
+identical to any other Bearer call; the UI just constructs the
+header from a different source.
+
+With complete OIDC metadata, the protected-route guard prefers
+the OIDC redirect. The direct `/admin/login` paste-token route is
+still reachable, including when `admin_ui.oidc.require_oidc` is
+true. That flag changes the login choices presented by the SPA;
+it is not route-level enforcement and must not be treated as the
+security boundary. Knievel's API authentication and authorization
+remain authoritative.
 
 ### What's intentionally not here
 
@@ -435,17 +461,16 @@ SDK.
 
 ## CORS
 
-Yes — required, because the dev workflow has the UI on
-`http://localhost:5173` (Vite) talking to the API on
-`http://localhost:8080`, and prod can plausibly run the UI on a
-different origin from the API (e.g. `admin.example.com` →
-`api.example.com`). Without CORS the browser blocks every
-preflighted request (anything with `Authorization` is
-preflighted).
+Knievel supports CORS for an intentional split-origin deployment
+(e.g. `admin.example.com` → `api.example.com`). The normal bundled
+production path is same-origin, and the normal Vite workflow also
+keeps browser requests same-origin through its development proxy.
+CORS is therefore available but is not required for either default
+path.
 
-### API-side changes
+### API-side configuration
 
-Add to `src/config.rs::ApiConfig`:
+`src/config.rs::ApiConfig` includes:
 
 ```rust,ignore
 /// Origins permitted to make cross-origin requests. Empty
@@ -461,10 +486,10 @@ wrap the route with `poem::middleware::Cors`:
 
 - `allow_origins`: from config.
 - `allow_methods`: `GET, POST, PATCH, DELETE, OPTIONS`.
-- `allow_headers`: `Authorization, Content-Type,
-  Idempotency-Key, If-Match, X-Request-Id`.
-- `expose_headers`: `ETag, Location, X-Request-Id,
-  X-Idempotency-Replayed`. (Anything custom that the UI needs
+- `allow_headers`: `Authorization`, `Content-Type`,
+  `Idempotency-Key`, `If-Match`, `X-Request-Id`.
+- `expose_headers`: `ETag`, `Location`, `X-Request-Id`,
+  `X-Idempotency-Replayed`. (Anything custom that the UI needs
   to read off responses.)
 - `allow_credentials`: **false**. We use bearer tokens, not
   cookies; staying credentials-less keeps the wildcard escape
@@ -474,20 +499,24 @@ wrap the route with `poem::middleware::Cors`:
 
 ### Dev defaults
 
-`config.example.yaml` gains:
+Vite proxies `/v1` and exactly `/admin/config.json` to
+`KNIEVEL_ADMIN_API_ORIGIN`, which defaults to
+`http://localhost:8080`. It deliberately does not proxy `/admin`
+or any other asset path. The variable is loaded only by the Vite
+server (there is no `VITE_` prefix), so it is not exposed to the
+browser or built bundle.
 
-```yaml
-api:
-  allowed_origins:
-    - http://localhost:5173    # vite dev
-    - http://127.0.0.1:5173
+Set a different local API without changing application code:
+
+```bash
+cd web/admin
+KNIEVEL_ADMIN_API_ORIGIN=http://127.0.0.1:9080 pnpm dev
 ```
 
-Vite's dev server can also proxy `/v1/*` to `localhost:8080`
-to side-step CORS during local development; we keep the CORS
-layer enabled anyway so the dev path matches prod. (Proxy is
-configured in `vite.config.ts` but is opt-in via env var, not
-the default.)
+Because the browser calls the Vite origin, the API can leave
+`allowed_origins` empty in this default workflow. Configure
+`allowed_origins` only when deliberately testing direct
+cross-origin requests.
 
 ### Prod guidance
 
@@ -501,7 +530,7 @@ the default.)
 
 ### Test coverage
 
-A new `tests/api_cors.rs` slice asserts:
+`tests/api_cors.rs` asserts:
 
 1. Empty `allowed_origins` → no `Access-Control-Allow-Origin`
    header on responses; OPTIONS returns 404 (poem's default).
@@ -513,46 +542,64 @@ A new `tests/api_cors.rs` slice asserts:
    `Allow-Headers`, `Max-Age`.
 4. `Authorization` is in the allowed-headers reflection.
 
-Add the slice's binary to `cargo xtask test-shape` so it runs
-in CI alongside the rest of `tests/api_*.rs`.
+This integration slice runs with the repository's API tests.
 
 ## Dev workflow
 
+Install once, then run the API and Vite in separate terminals:
+
 ```bash
-# One-time
-cd web/admin && pnpm install
+# Repository root
+pnpm --dir web/admin install --frozen-lockfile
+cargo run                                      # API on :8080
+```
 
-# Two terminals (or pnpm dev runs both via concurrently)
-cargo run                                    # API on :8080
-cd web/admin && pnpm dev                     # UI on :5173
+```bash
+# Second terminal, repository root
+pnpm --dir web/admin dev                       # UI at /admin/ on :5173
+```
 
-# Regenerate the typed client after touching openapi.yaml
+Open <http://localhost:5173/admin/>. Same-origin requests to
+`/v1` and `/admin/config.json` reach the API through Vite's
+development-only proxy. To target another API:
+
+```bash
+KNIEVEL_ADMIN_API_ORIGIN=http://127.0.0.1:9080 pnpm --dir web/admin dev
+```
+
+After changing `openapi.yaml`, regenerate and check the committed
+client from the repository root:
+
+```bash
 cargo xtask ui-client
-
-# Per-PR gates locally
-cd web/admin && pnpm lint && pnpm typecheck && pnpm test
 cargo xtask ui-client --check
+```
+
+Run the frontend PR gates with:
+
+```bash
+pnpm --dir web/admin typecheck
+pnpm --dir web/admin lint
+pnpm --dir web/admin format:check
+pnpm --dir web/admin test --run
+pnpm --dir web/admin build
 ```
 
 ## CI integration
 
-New jobs in `.github/workflows/ci.yml`, gated on changes to
-`web/admin/**` or `openapi.yaml`:
+The current `.github/workflows/ci.yml` jobs run on every PR:
 
 - `ui-typecheck` — `pnpm typecheck`
-- `ui-lint` — `pnpm lint`
+- `ui-lint` — `pnpm lint` plus `pnpm format:check`
 - `ui-test` — `pnpm test --run`
 - `ui-client-drift` — `cargo xtask ui-client --check`
-- `ui-build` — `pnpm build` (catches dead imports, type errors
-  the dev server tolerates, and bundle-size regressions via a
-  size-limit check)
-- `e2e` (nightly only, in `nightly.yml`) — Playwright against
-  a Postgres-backed compose stack
+- `ui-build` — `pnpm build`
 
-A new `.github/actions/node-setup/` composite handles pnpm +
-Node version pinning, mirroring `rust-setup`. Same caveat
-applies: callers must `actions/checkout@v4` before `uses:
-./.github/actions/node-setup` (gotcha #6 in `CLAUDE.md`).
+`nightly.yml` separately runs `pnpm size` and the Playwright
+smoke against the production preview. The smoke stubs runtime
+config and `/v1/whoami`; it does not require Postgres or an OIDC
+provider. The shared `.github/actions/node-setup/` action pins
+Node and pnpm and installs with the frozen lockfile.
 
 ## Test coverage
 
@@ -612,15 +659,11 @@ stage. CI's pnpm cache (via `actions/setup-node` with
 shoehorning a Node build into a Docker layer; we keep the
 Dockerfile focused on packaging.
 
-The Phase 4.1 `Dockerfile` gains exactly **one** new line:
+The runtime `Dockerfile` copies the built bundle and configures
+the shipped mount:
 
 ```dockerfile
 COPY web/admin/dist /var/lib/knievel/admin
-```
-
-…with two new env vars in the final stage:
-
-```dockerfile
 ENV KNIEVEL_ADMIN_UI__STATIC_DIR=/var/lib/knievel/admin
 ```
 
@@ -631,29 +674,11 @@ section).
 
 ### CI workflow shape
 
-`release.yml` (and the per-PR `ui-build` job in `ci.yml`)
-gain a Node setup + build step **before** the
-`docker/build-push-action` call, and the build context they
-hand to docker includes the populated `web/admin/dist/`:
-
-```yaml
-- uses: actions/checkout@v4
-- uses: pnpm/action-setup@v4
-  with: { version: 9 }
-- uses: actions/setup-node@v4
-  with:
-    node-version: 22
-    cache: pnpm
-    cache-dependency-path: web/admin/pnpm-lock.yaml
-- run: pnpm --dir web/admin install --frozen-lockfile
-- run: pnpm --dir web/admin build      # → web/admin/dist/
-
-- uses: docker/build-push-action@v6
-  with:
-    context: .                         # picks up web/admin/dist/
-    tags:    ghcr.io/<owner>/knievel:${{ github.ref_name }}
-    push:    true
-```
+The shared Node setup action installs the package with the frozen
+lockfile, then `ci.yml` and `release.yml` run
+`pnpm --dir web/admin build`. Release stages `dist/` beside the
+native Knievel binaries in a small `docker-context/` before
+calling `docker/build-push-action`.
 
 Wins from this split:
 
@@ -672,8 +697,8 @@ Wins from this split:
 
 ### Local dev wrapper
 
-Building the image locally needs the bundle present first.
-A new xtask:
+Building the image locally needs the bundle present first. The
+shipped wrapper is:
 
 ```bash
 cargo xtask build-image                 # pnpm build + docker build
@@ -724,18 +749,17 @@ file inside the bundle.
 
 ### ghcr.io publishing
 
-The existing `release.yml` workflow already publishes
+The existing `release.yml` workflow publishes
 `ghcr.io/<owner>/knievel` via `docker/build-push-action` on
-`v*` tags. No new workflow; the new pnpm + build steps slot
-in ahead of the existing docker step in the same lane. UI
-version === API version === git SHA, all the way through to
-`GET /version`.
+`v*` tags. Its pnpm build runs before the Docker step in the
+same lane. UI version === API version === git SHA, all the way
+through to `GET /version`.
 
-## Phasing
+## Phasing (historical plan)
 
-The UI is a new top-level workstream; it doesn't displace any
-Phase 3 task. Suggested decomposition once Phase 3 closes the
-hot-path rail (3.21):
+The sequence below records the original implementation decomposition.
+The current-status section and checked-in route tree above are
+authoritative for what is shipped:
 
 - **Phase 7.1** — Repo skeleton: `web/admin/` scaffold, vite +
   TS + Mantine, ESLint/Prettier, vitest harness, README. No

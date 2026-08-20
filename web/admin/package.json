@@ -10,7 +10,7 @@
     "build": "pnpm routes && tsc -b && vite build && node scripts/check-base-path.mjs",
     "preview": "vite preview",
     "typecheck": "pnpm routes && tsc -b --noEmit",
-    "lint": "pnpm routes && eslint .",
+    "lint": "pnpm routes && eslint . --max-warnings=0",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "pnpm routes && vitest",
@@ -38,7 +38,7 @@
     "@axe-core/react": "^4.10.1",
     "@eslint/js": "^9.17.0",
     "@playwright/test": "^1.49.1",
-    "@size-limit/preset-app": "^11.1.6",
+    "@size-limit/preset-app": "11.2.0",
     "@tanstack/react-query-devtools": "^5.62.7",
     "@tanstack/router-cli": "^1.95.1",
     "@tanstack/router-devtools": "^1.95.1",
@@ -52,16 +52,17 @@
     "eslint": "^9.17.0",
     "eslint-plugin-react-hooks": "^5.1.0",
     "eslint-plugin-react-refresh": "^0.4.16",
-    "happy-dom": "^15.11.7",
+    "happy-dom": "^20.11.6",
     "openapi-typescript": "^7.5.0",
-    "postcss": "^8.4.49",
+    "postcss": "^8.5.26",
     "postcss-preset-mantine": "^1.17.0",
     "postcss-simple-vars": "^7.0.1",
     "prettier": "^3.4.2",
+    "size-limit": "11.2.0",
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.18.2",
-    "vite": "^6.0.7",
-    "vitest": "^3.0.0"
+    "vite": "^6.4.3",
+    "vitest": "^3.2.7"
   },
   "packageManager": "pnpm@10.33.0",
   "engines": {
@@ -70,7 +71,10 @@
   "pnpm": {
     "onlyBuiltDependencies": [
       "esbuild"
-    ]
+    ],
+    "overrides": {
+      "estimo>nanoid": "5.1.16"
+    }
   },
   "size-limit": [
     {

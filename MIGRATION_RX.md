@@ -1,5 +1,13 @@
 # RX → Knievel Migration Guide
 
+> **Status — consumer-specific historical migration plan.** This file preserves
+> RX integration analysis and rollout history; it is not generic operator
+> guidance and its commands/examples have not been reconciled to every current
+> runtime limitation. Before executing anything, use [README.md](README.md),
+> [DEPLOYMENT.md](DEPLOYMENT.md), [AUTH.md](AUTH.md), and [API.md](API.md), then
+> verify the generated OpenAPI contract. In particular, old mode, snapshot,
+> image-storage, metrics, and client-helper claims below may be design-only.
+
 How RX moves from Kevel to knievel without behavior change. Companion
 to `REQUIREMENTS.md` and `API.md`; **not part of the platform spec**.
 Knievel is a general-purpose ad platform; this document is one

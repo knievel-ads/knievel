@@ -1,5 +1,13 @@
 # Knievel Requirements
 
+> **Status — design baseline, not the shipped contract.** This document records
+> product requirements and historical design decisions, including UI-adjacent
+> and future-facing material. A requirement or checked statement below is not
+> evidence that runtime behavior exists. For current precedence and navigation,
+> use [AGENTS.md](AGENTS.md), [CODEMAP.md](CODEMAP.md), [README.md](README.md),
+> and the generated [`openapi.yaml`](openapi.yaml). Preserve this record when
+> correcting current docs; change runtime claims only with source and tests.
+
 **Tagline:** Fearlessly fast ad delivery that steals the show.
 
 Knievel is a Rust ad-serving platform inspired by [Kevel](https://dev.kevel.com)'s

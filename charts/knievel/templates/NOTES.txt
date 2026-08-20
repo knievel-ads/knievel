@@ -1,4 +1,5 @@
-{{ include "knievel.fullname" . }} v{{ default .Chart.AppVersion .Values.image.tag }} installed in namespace "{{ .Release.Namespace }}".
+{{- $publicBaseUrl := required "api.publicBaseUrl is required (set the external API origin)" .Values.api.publicBaseUrl -}}
+{{ include "knievel.fullname" . }} installed in namespace "{{ .Release.Namespace }}".
 
 Image:    {{ include "knievel.image" . }}
 Replicas: {{ .Values.replicaCount }}
@@ -6,23 +7,38 @@ Replicas: {{ .Values.replicaCount }}
 Tail logs:
   kubectl -n {{ .Release.Namespace }} logs -f deployment/{{ include "knievel.fullname" . }}
 
-Probe the API in-cluster:
-  kubectl -n {{ .Release.Namespace }} run --rm -it --image=curlimages/curl curl-{{ randAlphaNum 5 | lower }} -- \
-    sh -c 'curl -fsS http://{{ include "knievel.fullname" . }}/healthz; echo'
+Probe liveness in-cluster:
+  kubectl -n {{ .Release.Namespace }} run --rm -it --restart=Never --image=curlimages/curl curl-{{ randAlphaNum 5 | lower }} -- \
+    curl -fsS http://{{ include "knievel.fullname" . }}/healthz
 
 {{- if not .Values.database.existingSecret }}
 
-⚠  database.existingSecret is empty. Set it to a Secret with
-   `username` and `password` keys (or override `database.userKey`
-   and `database.passwordKey`) before traffic arrives — the
-   binary will start but `/readyz` will stay 503 until it can
-   reach Postgres.
+⚠  database.existingSecret is empty. The pod does not receive
+   KNIEVEL_DB_USER / KNIEVEL_DB_PASSWORD, so config interpolation and startup
+   will fail. Supply a Secret with username/password (or override the key names).
 {{- end }}
 
-{{- if not .Values.api.publicBaseUrl }}
+{{- if eq $publicBaseUrl "http://localhost:8080" }}
 
-⚠  api.publicBaseUrl is empty. The minted impression / click
-   URLs in decision responses will use the request's host
-   header; pin a stable hostname here when an Ingress / LB sits
-   in front (REQUIREMENTS.md § 8.1).
+⚠  api.publicBaseUrl still has the lint-friendly localhost default. Override it
+   for every non-local install. Current server code nevertheless emits relative
+   /e/... tracking paths; do not rely on this value for URL rewriting yet.
+{{- end }}
+
+{{- if .Values.serviceMonitor.enabled }}
+
+⚠  serviceMonitor.enabled is unsupported: this chart renders a /metrics scrape,
+   but the current server has no /metrics route.
+{{- end }}
+
+{{- if .Values.sentry.enabled }}
+
+⚠  sentry.enabled is unsupported: the rendered top-level block is ignored and
+   the current binary has no Sentry SDK wiring.
+{{- end }}
+
+{{- if .Values.otel.enabled }}
+
+⚠  otel.enabled is unsupported: the rendered top-level block is ignored and
+   the current binary has no OTel exporter wiring.
 {{- end }}

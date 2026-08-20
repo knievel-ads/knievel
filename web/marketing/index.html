@@ -4,9 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>knievel — fearlessly fast ad delivery</title>
-  <meta name="description" content="Self-hosted, multi-tenant ad-serving platform. Postgres-native, OpenAPI-first, Rust under the hood.">
+  <meta name="description" content="Self-hosted, multi-tenant direct ad serving in Rust and PostgreSQL.">
   <meta property="og:title" content="knievel — fearlessly fast ad delivery">
-  <meta property="og:description" content="Self-hosted, multi-tenant ad-serving platform. Postgres-native, OpenAPI-first, Rust.">
+  <meta property="og:description" content="Self-hosted, multi-tenant direct ad serving in Rust and PostgreSQL.">
   <meta property="og:type" content="website">
   <link rel="stylesheet" href="style.css">
 </head>
@@ -17,20 +17,19 @@
     <h1>knievel</h1>
     <p class="tagline">Fearlessly fast ad delivery that steals the show.</p>
     <p class="lede">
-      Self-hosted, multi-tenant ad serving for publishers who want
-      direct delivery without running an exchange. A single Rust
-      binary, a generated Ruby gem, a Helm chart — all driven by
-      one OpenAPI spec.
+      A self-hosted, multi-tenant direct ad server for publishers.
+      Rust handlers, PostgreSQL tenancy, a generated OpenAPI contract,
+      a browser admin app, Compose, and Helm — without an exchange or
+      a second datastore.
     </p>
     <p class="cta">
       <a class="btn" href="#quickstart">Quickstart</a>
-      <a class="btn ghost" href="api.html">API reference</a>
+      <a class="btn ghost" href="api.html">Generated API</a>
       <a class="btn ghost" href="https://github.com/knievel-ads/knievel">GitHub →</a>
     </p>
     <p class="badges">
       <a href="https://github.com/knievel-ads/knievel/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/knievel-ads/knievel?display_name=tag&amp;sort=semver"></a>
       <a href="https://github.com/knievel-ads/knievel/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue"></a>
-      <a href="https://rubygems.org/gems/knievel"><img alt="RubyGems" src="https://img.shields.io/gem/v/knievel?label=gem"></a>
       <a href="https://github.com/knievel-ads/knievel/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/knievel-ads/knievel/actions/workflows/ci.yml/badge.svg"></a>
     </p>
   </div>
@@ -39,211 +38,161 @@
 <main class="wrap">
 
 <section id="why">
-  <h2>Why knievel</h2>
+  <h2>What Knievel is</h2>
   <ul class="bullets">
-    <li><strong>vs. Kevel.</strong> Domain model openly inspired by Kevel — advertiser → campaign → flight → ad, plus site / zone / priority / ad-type. Self-hostable on your own Postgres. No third-party data path.</li>
-    <li><strong>vs. building from scratch.</strong> The boring parts ship: opaque-token auth, project-scoped row-level security, partition manager + leader election, snapshot loader, idempotency cache, <code>:batchUpsert</code> per resource, cursor pagination, and a generated Ruby gem with hand-written <code>Enumerable</code> wrappers.</li>
-    <li><strong>vs. a generic ad framework.</strong> Opinionated about Postgres + OpenAPI 3.0 + multi-tenant. No pluggable storage backend, no GraphQL second-API, no per-tenant code. The narrowness is the point.</li>
-    <li><strong>vs. an OpenRTB stack.</strong> Knievel is publisher-side direct ad serving. No bid-request flow, no SSP integration, no real-time auction.</li>
+    <li><strong>Direct serving.</strong> Advertiser → campaign → flight → ad and site/zone inventory, openly inspired by Kevel's domain model.</li>
+    <li><strong>Self-hosted tenancy.</strong> Project requests are bound through PostgreSQL <code>FORCE ROW LEVEL SECURITY</code> under a non-superuser app role.</li>
+    <li><strong>One generated contract.</strong> The Rust service emits OpenAPI 3.0; the human table is checked as exact method/path pairs for all 62 generated operations.</li>
+    <li><strong>Not OpenRTB.</strong> No bid request flow, SSP, auction, GraphQL API, Redis, or Kafka.</li>
   </ul>
 </section>
 
 <section id="architecture">
-  <h2>Architecture in one diagram</h2>
+  <h2>Current architecture</h2>
   <pre class="diagram">
-┌──────────────┐     POST /v1/projects/{p}/decisions    ┌──────────────┐
-│ Calling app  │ ──────────────────────────────────────▶│   knievel    │
-│ (gem / curl) │ ◀──────────────────────────────────────│ (Rust/poem)  │
-└──────────────┘                                        └──────┬───────┘
-       ▲                                          in-mem       │
-       │                                          snapshot     ▼
-       │                                                  ┌──────────────┐
-       └─ impression/click pings ─────────────────────────▶│   Postgres   │
-          GET /e/i/&lt;sig&gt;                                   │  (config +   │
-          GET /e/c/&lt;sig&gt;                                   │  partitioned │
-                                                           │   events)    │
-                                                           └──────────────┘
+┌──────────────┐     bearer + project path      ┌──────────────┐
+│ Calling app  │ ─────────────────────────────▶ │   knievel    │
+│ or admin SPA │ ◀───────────────────────────── │ (Rust/poem)  │
+└──────────────┘                                └──────┬───────┘
+                                                          │ RAM snapshot
+                                                          ▼
+                                                   ┌──────────────┐
+ GET /e/i/&lt;signed&gt; ── best-effort event channel ─▶ │  PostgreSQL  │
+ GET /e/c/&lt;signed&gt;          per-row INSERTs        │ config/events│
+                                                   └──────────────┘
   </pre>
   <p>
-    Decisions touch RAM only — the configuration snapshot is keyed
-    by <code>(project_id, resource)</code> and refreshed on
-    Postgres <code>LISTEN</code>/<code>NOTIFY</code> with a 5-second
-    poll backstop. Events are buffered in an in-process channel and
-    <code>COPY</code>'d to partitioned tables every 1–2 seconds.
-    The partition manager runs in-process under a Postgres
-    advisory-lock leader election. No second datastore. Full picture
-    in
+    Each pod cold-loads configuration and polls a sequence every five
+    seconds. Management writes do not currently bump that sequence and
+    LISTEN/NOTIFY is not active, so write-triggered refresh is not a shipped
+    guarantee. Event batches use per-row INSERTs, not COPY. Retention is
+    detach-not-drop, and the broad 2026 seed leaf currently overlaps the daily
+    maintenance ranges. Read the verified flow in
     <a href="https://github.com/knievel-ads/knievel/blob/main/ARCHITECTURE.md">ARCHITECTURE.md</a>.
   </p>
 </section>
 
-<section id="quickstart">
-  <h2>Quickstart (5 minutes)</h2>
-  <p>
-    Brings up Postgres + knievel + a seed sidecar that creates one
-    of each resource and drops a bearer at
-    <code>tmp/knievel-dev-token</code>:
-  </p>
-  <pre><code>git clone https://github.com/knievel-ads/knievel
-cd knievel
-docker compose -f examples/compose/compose.yaml up -d
-curl -fsS http://localhost:8080/healthz
-# =&gt; ok</code></pre>
-
-  <p>From Ruby, the <code>Enumerable</code> wrapper hides the cursor walk:</p>
-  <pre><code>require "knievel/client"
-
-client = Knievel::Client.new(
-  host: "http://localhost:8080",
-  access_token: ENV.fetch("TOKEN"),
-)
-
-client.advertisers(project_id).each      { |adv| puts adv.name }
-client.advertisers(project_id).first(10)
-client.advertisers(project_id).lazy.select(&amp;:is_active).first(20)</code></pre>
-
-  <p>
-    Full quickstart with the deterministic project-id derivation,
-    decision request, and teardown:
-    <a href="https://github.com/knievel-ads/knievel#quickstart-5-minutes">README §
-      Quickstart</a>.
-  </p>
-</section>
-
 <section id="surface">
-  <h2>What's in v0</h2>
+  <h2>What ships</h2>
   <div class="grid">
     <div class="card">
       <h3>Decision API</h3>
       <p>
-        <code>POST /v1/projects/{project_id}/decisions</code> with
-        priority-tiered selection, weighted random, blocklists, force
-        overrides (gated three ways). HMAC-signed
-        <code>/e/i/&lt;sig&gt;</code> impression and
-        <code>/e/c/&lt;sig&gt;</code> click endpoints with stable
-        <code>dedup_key</code> across signing-secret rotation.
+        Multi-placement selection, blocklists, priority tiers, weighted
+        choice, typed creative responses, Liquid rendering, and an explainer.
+        Authentication and tenant proof still touch PostgreSQL before the
+        selection core reads RAM.
       </p>
     </div>
     <div class="card">
       <h3>Management API</h3>
       <p>
-        Full CRUD plus <code>:batchUpsert</code> for advertisers,
-        campaigns, flights, ads, sites, zones — single Postgres
-        transaction with per-row diagnostics. Cursor-paginated lists
-        across the eight demand+inventory chains
-        (<code>?limit=N&amp;cursor=…</code>, default 50, max 500).
+        Generated org/project, token, ad-library, demand, inventory,
+        creative-template, image-upload, and taxonomy operations. The exact
+        operation set is the contract; older member/project-update designs are
+        not routes.
       </p>
     </div>
     <div class="card">
-      <h3>Events &amp; reporting</h3>
+      <h3>Events &amp; rollup</h3>
       <p>
-        Decision/impression/click rows buffered in-process,
-        <code>COPY</code>'d to partitioned Postgres tables every 1–2 s.
-        Hourly rollup table for cheap reporting reads. In-process
-        partition manager pre-makes 4 days of partitions; drops
-        past-retention.
+        Decision, impression, and click rows flow through a bounded memory
+        channel into partitioned PostgreSQL. <code>events_rollup</code> is
+        computed hourly. Timestamp-sensitive dedup and detached retention
+        leaves require operator care.
       </p>
     </div>
     <div class="card">
-      <h3>Auth &amp; tenancy</h3>
+      <h3>Opaque + JWT auth</h3>
       <p>
-        Opaque-token bearers (argon2id at rest) plus optional JWT via
-        JWKS auto-discovery. Project-scoped Reader / Editor / Admin
-        roles. Postgres <code>FORCE ROW LEVEL SECURITY</code>
-        on every per-tenant table; CI-enforced cross-tenant suite
-        covers every project-scoped endpoint.
+        Argon2-backed opaque tokens are always available with a database.
+        Configured issuer policies add JWT verification; RS256 is the usable
+        runtime key path today. There is no <code>auth.modes</code> disable
+        switch.
       </p>
     </div>
     <div class="card">
-      <h3>Generated client</h3>
+      <h3>Browser admin</h3>
       <p>
-        <a href="https://rubygems.org/gems/knievel">Ruby gem</a> with
-        idiomatic <code>Enumerable</code> walks. Spec-driven so a
-        future Python or Go binding rides on the same OpenAPI surface.
-        Local-dev default <code>servers:</code> baked in; consumers
-        override host for production.
+        The release image serves a React app at <code>/admin/</code>. OIDC PKCE
+        and pasted opaque tokens both use browser <code>sessionStorage</code>,
+        so same-origin XSS is a bearer-token boundary.
       </p>
     </div>
     <div class="card">
-      <h3>Observability</h3>
+      <h3>Deployment artifacts</h3>
       <p>
-        Structured JSON logs via <code>tracing</code>; OTLP-exported
-        OpenTelemetry spans; Sentry error reporting. All three carry
-        the same <code>request_id</code> / <code>trace_id</code>.
-        <code>/healthz</code>, <code>/readyz</code>,
-        <code>/version</code>, <code>/openapi.json</code> served live.
+        Native amd64/arm64 image manifests, an OCI Helm chart, a reference
+        Compose stack, and three CLI archive targets are produced only from an
+        explicit release tag.
       </p>
     </div>
   </div>
+</section>
+
+<section id="limits">
+  <h2>Know the limits</h2>
+  <ul class="bullets">
+    <li>Creative image uploads use process-local memory and disappear on restart; no S3/MinIO backend is wired.</li>
+    <li>OTel and Sentry config is parsed/stubbed, but no exporter or SDK sends data.</li>
+    <li>There is no <code>/metrics</code> route; the chart ServiceMonitor option is unsupported.</li>
+    <li><code>api.public_base_url</code> is parsed but tracking URLs are currently relative <code>/e/...</code> paths.</li>
+    <li><code>/readyz</code> checks DB reachability only, not snapshot or event-flusher health.</li>
+    <li>DB-backed tests can self-skip without <code>DATABASE_URL</code>; most acceptance and all chaos designs are not active coverage.</li>
+  </ul>
+</section>
+
+<section id="quickstart">
+  <h2>Quickstart</h2>
   <p>
-    Deliberately <em>not</em> in v0: OpenRTB, experiment framework,
-    reporting UI, second datastore. Per-row idempotency on POST
-    creates moves to Phase 6. See
-    <a href="https://github.com/knievel-ads/knievel/blob/main/REQUIREMENTS.md#11-non-goals">
-      REQUIREMENTS § 11</a>.
+    Create the writable token directory, start only PostgreSQL and the server,
+    wait for health, then run the DB-direct seeder as your host UID/GID:
+  </p>
+  <pre><code>git clone https://github.com/knievel-ads/knievel
+cd knievel
+mkdir -p tmp
+
+docker compose -f examples/compose/compose.yaml up -d \
+  knievel-postgres knievel
+until curl -fsS http://localhost:8080/healthz; do sleep 2; done
+
+docker compose -f examples/compose/compose.yaml run --rm \
+  --user "$(id -u):$(id -g)" knievel-seed</code></pre>
+  <p>
+    Capture the printed project/site/ad-type IDs, restart Knievel for a cold
+    snapshot load, and issue the real decision curl from the
+    <a href="https://github.com/knievel-ads/knievel#verified-local-quickstart">verified README sequence</a>.
+    The IDs are not assumed to be <code>1</code>.
   </p>
 </section>
 
 <section id="deploy">
-  <h2>Deploy</h2>
+  <h2>Deploy deliberately</h2>
   <ul class="bullets">
-    <li>
-      <strong>Helm:</strong>
-      <code>helm install knievel oci://ghcr.io/knievel-ads/charts/knievel</code>
-    </li>
-    <li>
-      <strong>Container image:</strong>
-      <code>ghcr.io/knievel-ads/knievel:vX.Y.Z</code> — multi-arch,
-      cosign-signed, build-provenance-attested, tagged on semver
-      tags only.
-    </li>
-    <li>
-      <strong>Compose:</strong>
-      <code>examples/compose/</code> for local + bring-your-own-Postgres.
-    </li>
-    <li>
-      <strong>Postgres:</strong> 14+ vanilla. Aurora, RDS, Cloud SQL,
-      Supabase all supported. Only required extension is
-      <code>pgcrypto</code>.
-    </li>
+    <li><strong>Image:</strong> <code>ghcr.io/knievel-ads/knievel</code>; use <code>@sha256:...</code> in controlled environments.</li>
+    <li><strong>Helm:</strong> <code>oci://ghcr.io/knievel-ads/charts/knievel</code>; supply DB coordinates, Secret, and <code>api.publicBaseUrl</code>.</li>
+    <li><strong>Database:</strong> the reference and CI environment use PostgreSQL 16 with a <code>NOSUPERUSER NOBYPASSRLS</code> app role and a separate <code>NOLOGIN BYPASSRLS</code> loader role.</li>
+    <li><strong>Local image:</strong> <code>cargo xtask build-image --tag knievel:local</code>; the Dockerfile packages prebuilt artifacts.</li>
   </ul>
-  <p>
-    Operator's playbook (sizing, secrets, runbooks, troubleshooting):
-    <a href="https://github.com/knievel-ads/knievel/blob/main/DEPLOYMENT.md">
-      DEPLOYMENT.md</a>.
-  </p>
+  <p><a href="https://github.com/knievel-ads/knievel/blob/main/DEPLOYMENT.md">Read the operator guide →</a></p>
 </section>
 
 <section id="docs">
   <h2>Documentation</h2>
   <table>
-    <tr><th>Doc</th><th>Audience</th><th>What it covers</th></tr>
-    <tr><td><a href="https://github.com/knievel-ads/knievel/blob/main/README.md">README</a></td><td>first-time reader</td><td>Tagline, quickstart, status, hello-world decision.</td></tr>
-    <tr><td><a href="https://github.com/knievel-ads/knievel/blob/main/REQUIREMENTS.md">REQUIREMENTS</a></td><td>platform contract</td><td>The complete v0 spec. Authoritative.</td></tr>
-    <tr><td><a href="api.html">API browser</a></td><td>API consumer</td><td>Live Redoc rendering of <code>openapi.yaml</code>.</td></tr>
-    <tr><td><a href="https://github.com/knievel-ads/knievel/blob/main/AUTH.md">AUTH</a></td><td>integrator</td><td>Token shape, JWT mode, role matrix.</td></tr>
-    <tr><td><a href="https://github.com/knievel-ads/knievel/blob/main/REPORTING.md">REPORTING</a></td><td>data engineer</td><td>Event schema, rollup tables, warehouse contract.</td></tr>
-    <tr><td><a href="https://github.com/knievel-ads/knievel/blob/main/ARCHITECTURE.md">ARCHITECTURE</a></td><td>operator + contributor</td><td>How the binary is built and what runs in-process.</td></tr>
-    <tr><td><a href="https://github.com/knievel-ads/knievel/blob/main/DEPLOYMENT.md">DEPLOYMENT</a></td><td>operator</td><td>Helm + compose, sizing, runbooks, observability.</td></tr>
-    <tr><td><a href="https://github.com/knievel-ads/knievel/blob/main/CHANGELOG.md">CHANGELOG</a></td><td>everyone</td><td>What shipped in each release.</td></tr>
-    <tr><td><a href="https://github.com/knievel-ads/knievel/blob/main/CONTRIBUTING.md">CONTRIBUTING</a></td><td>contributor</td><td>Setup, gates, commit conventions, doc rules.</td></tr>
+    <tr><th>Document</th><th>Use it for</th></tr>
+    <tr><td><a href="https://github.com/knievel-ads/knievel/blob/main/AGENTS.md">AGENTS</a></td><td>Repository rules and source precedence.</td></tr>
+    <tr><td><a href="https://github.com/knievel-ads/knievel/blob/main/CODEMAP.md">CODEMAP</a></td><td>Entry points, flows, owners, impact checks.</td></tr>
+    <tr><td><a href="api.html">Generated API</a></td><td>OpenAPI rendered from the current main branch.</td></tr>
+    <tr><td><a href="https://github.com/knievel-ads/knievel/blob/main/API.md">API prose</a></td><td>Exact operation table and current direct-route behavior.</td></tr>
+    <tr><td><a href="https://github.com/knievel-ads/knievel/blob/main/AUTH.md">AUTH</a></td><td>Effective bearer and issuer fields.</td></tr>
+    <tr><td><a href="https://github.com/knievel-ads/knievel/blob/main/REPORTING.md">REPORTING</a></td><td>Actual table types, kinds, dedup, rollup, and capacity math.</td></tr>
+    <tr><td><a href="https://github.com/knievel-ads/knievel/blob/main/SECURITY.md">SECURITY</a></td><td>Private reporting and trust boundaries.</td></tr>
   </table>
-</section>
-
-<section id="status">
-  <h2>Status &amp; stability</h2>
   <p>
-    <code>0.1.x</code> is "surface stabilizing." The wire contract is
-    forward-compatible from this point — every change is
-    <strong>additive</strong> unless a 6-month deprecation window has
-    elapsed. Generated client compatibility follows a major.minor
-    mirror (gem <code>X.Y.*</code> ↔ server spec <code>X.Y</code>).
-    Full contract in
-    <a href="https://github.com/knievel-ads/knievel/blob/main/REQUIREMENTS.md#64-api-compatibility-policy">
-      REQUIREMENTS § 6.4</a>.
-  </p>
-  <p>
-    Live progress: <a href="https://github.com/knievel-ads/knievel/blob/main/PHASES.md">PHASES.md</a>.
+    REQUIREMENTS, UI, E2E, PHASES, and DOCUMENTATION_PLAN are design or
+    historical records. Their unchecked items are not proof of shipped behavior
+    or the active backlog.
   </p>
 </section>
 
@@ -251,11 +200,9 @@ client.advertisers(project_id).lazy.select(&amp;:is_active).first(20)</code></pr
 
 <footer class="wrap">
   <p>
-    knievel is MIT-licensed. Domain model openly inspired by
-    <a href="https://www.kevel.com/">Kevel</a>. Built on
-    <a href="https://github.com/poem-web/poem">poem</a>,
-    <a href="https://docs.rs/poem-openapi">poem-openapi</a>, and
-    <a href="https://github.com/launchbadge/sqlx">sqlx</a>.
+    This repository's server and CLI are MIT-licensed. The separately generated
+    Ruby package retains its own Apache-2.0 metadata. Domain model openly
+    inspired by <a href="https://www.kevel.com/">Kevel</a>.
   </p>
 </footer>
 

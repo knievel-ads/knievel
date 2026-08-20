@@ -1,5 +1,12 @@
 # Knievel Implementation Phases
 
+> **Status — historical implementation log.** This file preserves phase-era
+> sequencing, checkboxes, notes, and commit references for audit context. It is
+> no longer the repository's live status or contribution contract, and unchecked
+> boxes are **not** the current backlog. Use [AGENTS.md](AGENTS.md),
+> [CODEMAP.md](CODEMAP.md), current source, and GitHub issues/PRs for active work.
+> Do not rewrite old entries merely to make them read like current behavior.
+
 The execution roadmap for taking knievel from a planning corpus to a
 runnable, tested service. Companion to every other doc in the repo;
 this file is the living progress log.

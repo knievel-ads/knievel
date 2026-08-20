@@ -1,398 +1,302 @@
-# Deployment
+# Deploying Knievel
 
-Operator's guide to running knievel in production. Prescriptive where
-the spec allows; opinionated where it doesn't. The happy path is
-**self-contained** — a reader following this doc shouldn't need
-`REQUIREMENTS.md` open to get a working install. Deep dives are
-linked, not inlined.
+This is the current operator guide. For process internals see
+[ARCHITECTURE.md](ARCHITECTURE.md); for repository ownership see
+[CODEMAP.md](CODEMAP.md). Older requirement and migration documents contain
+unimplemented deployment designs and are not runbooks.
 
-## 1. Prerequisites
+## Shipped artifacts
 
-| Component | Required version | Notes |
-|---|---|---|
-| Postgres | 14 or later | Cluster writer endpoint reachable from knievel pods. `pgcrypto` extension available (every cloud provider ships it). Partitions are managed in-process by knievel; no `pg_partman` install needed. |
-| S3-compatible object store | any | AWS S3, MinIO, R2, Cloudflare R2, GCS via the S3 interop layer, etc. Used for creative images. |
-| Container runtime | OCI | knievel ships as a multi-arch container image (`linux/amd64` + `linux/arm64`). Helm chart for Kubernetes; compose manifest for single-node. |
-| OpenTelemetry collector | any | Optional but recommended. OTLP/gRPC endpoint. |
-| Sentry | any tier | Optional. DSN supplied via env. |
-| Argon2id support | n/a | Token verification uses argon2; no platform dep — bundled into the binary. |
+| Artifact | Location / publication |
+|---|---|
+| Multi-platform server image | `ghcr.io/knievel-ads/knievel` |
+| OCI Helm chart | `oci://ghcr.io/knievel-ads/charts/knievel` |
+| Reference local stack | [`examples/compose/`](examples/compose/) |
+| Server/CLI source build | Rust workspace in this repository |
+| Admin bundle | Packaged inside the release image at `/var/lib/knievel/admin` |
 
-A single-node compose stack (Postgres + knievel + a seed sidecar) is
-documented in § 5.
-
-## 2. Sizing guidance
-
-Per `REQUIREMENTS.md` § 9. **TARGET (unverified)** until the v0.1.0
-benchmark in `bench/results/v0.1.md` lands; numbers below are upper
-bounds the design supports, not measurements.
-
-**Per pod:**
-
-- CPU: 1 vCPU baseline; 2 vCPU under load.
-- Memory: 512 MiB baseline; 1 GiB with snapshots over 10k ads.
-- DB connections: 12 (configurable; see `REQUIREMENTS.md` § 7.8).
-- Decision throughput: ~5k req/s at SLO.
-- Event ingest: ~50k events/s (in-memory channel + `COPY` batches).
-
-**Postgres:**
-
-- Writer instance scales with event-write throughput, not decision
-  rate.
-- Connection budget per knievel pod × pod count must fit inside the
-  Postgres connection limit. Aurora's `max_connections` is the
-  practical ceiling for cloud deploys; raise the parameter group, not
-  the pod count, when in doubt.
-- Read replicas don't speed up decisions (RAM snapshot does). They
-  do help downstream warehouse copies.
-
-**Object store:** independent. Pick whatever is closest to your
-serving region.
-
-## 3. Database setup
-
-### Schema + role
-
-```sql
--- Run once, before knievel boots.
-CREATE DATABASE knievel;
-\c knievel
-
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
-CREATE ROLE knievel_app LOGIN PASSWORD '<vault-it>';
-ALTER ROLE knievel_app SET search_path TO knievel, public;
-
-CREATE SCHEMA knievel AUTHORIZATION knievel_app;
-
--- Optional: a read-only role for warehouse extracts (see REPORTING.md).
-CREATE ROLE knievel_reader LOGIN PASSWORD '<vault-it>';
-ALTER ROLE knievel_reader SET search_path TO knievel, public;
-GRANT USAGE ON SCHEMA knievel TO knievel_reader;
-GRANT SELECT ON ALL TABLES IN SCHEMA knievel TO knievel_reader;
-ALTER DEFAULT PRIVILEGES FOR ROLE knievel_app IN SCHEMA knievel
-  GRANT SELECT ON TABLES TO knievel_reader;
-```
-
-### Important: `knievel_app` is **NOT a superuser**
-
-Postgres `FORCE ROW LEVEL SECURITY` is bypassed by superusers. The
-reference compose stack (`examples/compose/init.sql`) downgrades
-`knievel_app` to `NOSUPERUSER CREATEDB` immediately after creation.
-The CI test harness does the same. **If you provision the role with
-`SUPERUSER`, RLS will appear to work in dev and silently fail in
-production.** This is gotcha 17 in `CLAUDE.md`.
-
-### Backups
-
-Backup is **operator-owned**. Knievel doesn't ship a backup helper.
-Recommended baselines:
-
-- **Daily logical dumps** of the `knievel` schema (excluding
-  `events_raw` partitions if they're large; see `REPORTING.md` for
-  the warehouse-copy alternative).
-- **PITR (point-in-time recovery)** via the cloud provider's tier
-  if you're on Aurora or Cloud SQL.
-- **Test restores** quarterly. Untested backups don't exist.
-
-## 4. Helm install
-
-The chart at `charts/knievel/` is the recommended path. Published as
-an OCI artifact; install:
+Publication happens only from an explicit `v*` Git tag. The release workflow
+creates image tags `X.Y.Z`, `X.Y`, `X`, and `sha-<commit>` (without a leading
+`v`), signs the merged manifest, and attaches provenance. Use an immutable
+manifest digest for controlled environments:
 
 ```sh
-helm install knievel oci://ghcr.io/knievel-ads/charts/knievel \
-  --version 0.1.0 \
-  -f values.yaml
+docker pull ghcr.io/knievel-ads/knievel@sha256:<manifest-digest>
 ```
 
-A starter `values.yaml` for a single-replica cluster:
+The runtime Dockerfile does not compile source. Build a native local image with:
+
+```sh
+cargo xtask build-image --tag knievel:local
+```
+
+This runs the admin build, locked Rust release build, staging step, and Docker
+packaging. `--skip-ui` creates a headless bundle placeholder.
+
+## PostgreSQL requirements and roles
+
+The reference and CI environments use PostgreSQL 16. The application expects a
+writable primary endpoint, the `knievel` schema, and permission to run its sqlx
+migrations when `database.auto_migrate` is true.
+
+Never connect request traffic as a PostgreSQL superuser. Superusers bypass
+`FORCE ROW LEVEL SECURITY`. A representative one-time bootstrap, run by a DB
+administrator, is:
+
+```sql
+CREATE ROLE knievel_app
+  LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD 'replace-me';
+CREATE SCHEMA knievel AUTHORIZATION knievel_app;
+ALTER ROLE knievel_app SET search_path = knievel, public;
+
+CREATE ROLE knievel_loader NOLOGIN BYPASSRLS;
+GRANT knievel_loader TO knievel_app;
+GRANT USAGE ON SCHEMA knievel TO knievel_loader;
+
+-- Tables are created later by migrations owned by knievel_app.
+ALTER DEFAULT PRIVILEGES FOR ROLE knievel_app IN SCHEMA knievel
+  GRANT SELECT ON TABLES TO knievel_loader;
+ALTER DEFAULT PRIVILEGES FOR ROLE knievel_app IN SCHEMA knievel
+  GRANT SELECT ON SEQUENCES TO knievel_loader;
+```
+
+After migrations create the rollup tables, bound loader writes to only those
+outputs:
+
+```sql
+GRANT INSERT, UPDATE ON knievel.events_rollup TO knievel_loader;
+GRANT UPDATE ON knievel.events_rollup_watermark TO knievel_loader;
+```
+
+The snapshot loader needs SELECT across active configuration tables and the
+`config_version` sequence. The rollup also needs SELECT on `events_raw`. Keep
+`knievel_loader` `NOLOGIN`; request code must never use it.
+
+The app pool is also held by the advisory-lock leader connection. Size
+`database.max_connections` for normal request/auth work plus that long-lived
+acquisition and background queries. The current code does not create separate
+LISTEN or COPY pools despite older sizing documents.
+
+## Configuration loading
+
+Knievel loads, in increasing precedence:
+
+1. Rust defaults;
+2. YAML at `KNIEVEL_CONFIG` (default `/etc/knievel/config.yaml`); and
+3. `KNIEVEL_` environment overrides, with `__` between nested keys.
+
+Environment placeholders in the YAML are expanded before parse. `${NAME}` is
+required; `${NAME:default}` has a fallback. Expansion also sees comments, so do
+not put a literal required placeholder in a comment.
+
+Unknown YAML fields are accepted and ignored. A value appearing in a file or
+Helm ConfigMap is therefore not proof that the process consumes it.
+
+### Effective fields
+
+| Field | Current effect |
+|---|---|
+| `api.bind_addr` | Listener address. |
+| `api.allowed_origins` | Literal CORS allowlist; empty disables CORS middleware. |
+| `api.shutdown_drain_timeout_secs` | Poem graceful-drain timeout. |
+| `database.url` | PostgreSQL connection URL. |
+| `database.max_connections` | Pool maximum. |
+| `database.auto_migrate` | Runs bundled sqlx migrations at boot. |
+| `database.required` | Missing/unusable DB is fatal when true. |
+| `database.connect_retry.*` | Initial exponential retry attempts/backoff. |
+| `logging.level`, `logging.format` | `tracing-subscriber` filter and JSON/compact format. |
+| `logging.request_log_*` | Request logging enablement, exact skip paths, slow threshold. |
+| `events.channel_capacity` | In-process event channel size. |
+| `decisions.force_overrides_enabled` | Process-wide force-override gate. |
+| `partitions.retention_days` | Age at which attached raw-event leaves are detached. |
+| `auth.jwt.issuers` | Enables JWT verification alongside opaque tokens. |
+| `admin_ui.static_dir`, `admin_ui.oidc.*` | Static SPA mount and public runtime OIDC metadata. |
+
+### Parsed but ineffective or stubbed
+
+| Field | Current limitation |
+|---|---|
+| `api.public_base_url` | Required by the typed `api` block but not used to build tracking URLs; decisions return relative `/e/...` paths. |
+| `api.shutdown_total_timeout_secs` | Parsed and included in the listener log, but not enforced; only the drain timeout is passed to Poem. |
+| `database.schema` | Parsed, but pool setup hard-codes `search_path TO knievel, public`. |
+| `tracing.otel.*` | Logs an enablement message; no exporter is installed. |
+| `errors.sentry.*` | Logs an enablement message; no Sentry SDK is installed. |
+
+The full, intentionally trimmed example is
+[`config.example.yaml`](config.example.yaml).
+
+## Reference Compose stack
+
+Use the repository-root instructions in [README.md](README.md). The important
+order is:
+
+1. create writable `tmp/`;
+2. start only `knievel-postgres` and `knievel`;
+3. wait for `/healthz` so migrations have completed;
+4. run `knievel-seed` with the host UID/GID;
+5. capture project/site/ad-type IDs from stdout;
+6. restart `knievel` for a cold snapshot load; and
+7. issue a decision and require a non-empty result.
+
+Starting every Compose service at once races the DB-direct seeder against
+migrations and does not refresh the running snapshot. The seeder is a manually
+invoked one-shot service, not a durable sidecar.
+
+The default image reference is the mutable major tag. Override it with a local
+image or immutable digest:
+
+```sh
+KNIEVEL_IMAGE=knievel:local \
+  docker compose -f examples/compose/compose.yaml up -d knievel-postgres knievel
+
+KNIEVEL_IMAGE=ghcr.io/knievel-ads/knievel@sha256:<manifest-digest> \
+  docker compose -f examples/compose/compose.yaml up -d knievel-postgres knievel
+```
+
+The Compose DB bootstrap intentionally grants broader loader default writes
+than recommended production provisioning so migrations-created rollup tables
+work without a second admin step. Do not copy that convenience grant into a
+least-privilege production role unchanged.
+
+## Helm
+
+A minimal render/install needs DB coordinates, a Secret with username/password,
+and an explicit externally meaningful API base URL:
+
+```sh
+helm upgrade --install knievel \
+  oci://ghcr.io/knievel-ads/charts/knievel \
+  --set database.host=db.example \
+  --set database.name=knievel \
+  --set database.existingSecret=knievel-db \
+  --set api.publicBaseUrl=https://ads.example
+```
+
+`api.publicBaseUrl` must be non-empty because the rendered typed `api` block
+otherwise omits a required field and startup fails. The chart default is a
+local-development value so `helm lint` can render; production must override it.
+The server currently still returns relative tracking paths, so the value is
+required configuration hygiene rather than working URL rewriting.
+
+The chart's image helper accepts either:
 
 ```yaml
 image:
   repository: ghcr.io/knievel-ads/knievel
-  tag: v0.1.0          # or a digest: 'sha256:<digest>' for immutability
-  pullPolicy: IfNotPresent
-
-replicaCount: 1
-
-resources:
-  requests:
-    cpu: 500m
-    memory: 512Mi
-  limits:
-    cpu: 2000m
-    memory: 1Gi
-
-database:
-  url: ${KNIEVEL_DATABASE_URL}    # `${VAR}` interpolation in config.yaml
-  maxConnections: 12
-
-events:
-  retentionDays: 30
-  channelCapacity: 8192
-
-hmac:
-  defaultSecretRef:
-    name: knievel-hmac
-    key: default
-
-sentry:
-  dsn: ${KNIEVEL_SENTRY_DSN}
-
-otel:
-  endpoint: http://otel-collector:4317
-
-ingress:
-  enabled: true
-  className: nginx
-  hosts:
-    - host: api.knievel.example
-      paths: [{ path: /, pathType: Prefix }]
-
-serviceAccount:
-  create: true
-  annotations: {}
-
-securityContext:
-  runAsNonRoot: true
-  readOnlyRootFilesystem: true
-  allowPrivilegeEscalation: false
+  tag: "X.Y.Z"            # renders repository:X.Y.Z
 ```
 
-The chart wires Postgres password and Sentry DSN through env vars
-referenced via `${VAR}` interpolation; what gets injected and how is
-covered in § 7.
-
-## 5. Compose install
-
-Single-binary + bring-your-own-Postgres. Same compose stack the
-acceptance tests in `TESTING.md` § 7 run against:
-
-```sh
-docker compose -f examples/compose/compose.yaml up -d
-# Postgres comes up, knievel comes up, knievel-seed runs once and exits
-# bearing a fixture project + token at ./tmp/knievel-dev-token.
-
-curl -fsS http://localhost:8080/healthz
-```
-
-The compose default pulls the published image; set `KNIEVEL_BUILD=1`
-to build from the local checkout instead. See
-`examples/compose/README.md` for the full set of overrides.
-
-For long-lived single-node deployments, run compose under a process
-supervisor (systemd, etc.) and back the Postgres data volume up
-yourself. The compose layout is intentionally close to the chart
-(same env var names, same healthcheck shape) so the operational
-muscle memory carries between them.
-
-## 6. Bare metal / systemd
-
-The container image is the blessed path. Bare-metal users get the
-static `knievel` and `knievel-cli` binaries from the GitHub Release
-page (one per `linux/{amd64,arm64}-musl`, plus
-`{x86_64,aarch64}-apple-darwin` for laptop installs) plus a sample
-unit file:
-
-```ini
-# /etc/systemd/system/knievel.service
-[Unit]
-Description=knievel
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=notify
-User=knievel
-Group=knievel
-Environment=KNIEVEL_CONFIG=/etc/knievel/config.yaml
-ExecStart=/usr/local/bin/knievel
-Restart=on-failure
-RestartSec=5s
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadOnlyPaths=/etc/knievel
-
-[Install]
-WantedBy=multi-user.target
-```
-
-You own backups, monitoring, and process supervision. The chart
-covers all three when you go that route.
-
-## 7. Secrets management
-
-Three secrets the operator owns:
-
-| Secret | What it does | Sourced from |
-|---|---|---|
-| `KNIEVEL_DATABASE_URL` | Connection string with `knievel_app` password | Vault / Secrets Manager / chart-templated `Secret` |
-| `KNIEVEL_HMAC_DEFAULT_SECRET` | Mints/verifies impression+click URL signatures | Same; rotate via the procedure in `AUTH.md` |
-| `KNIEVEL_SENTRY_DSN` | Sentry project endpoint (optional) | Same |
-
-All three are projected into the container as env vars. `config.yaml`
-references them with `${VAR}` interpolation:
+or:
 
 ```yaml
-database:
-  url: ${KNIEVEL_DATABASE_URL}
-hmac:
-  default_secret: ${KNIEVEL_HMAC_DEFAULT_SECRET}
-observability:
-  sentry:
-    dsn: ${KNIEVEL_SENTRY_DSN}
+image:
+  repository: ghcr.io/knievel-ads/knievel
+  tag: "sha256:<digest>"  # renders repository@sha256:<digest>
 ```
 
-The Helm chart's `secrets:` block templates a `Secret` and projects
-it into the deployment's env. Operators with a centralized secret
-store (Vault / external-secrets-operator) project the same env vars
-and the chart picks them up unchanged.
+A `sha-<commit>` value is a mutable-looking tag, not a digest. Do not prepend
+`v` to semver image tags produced by the current workflow.
 
-API tokens (`kvl_<env>_<scope>_<short-id>_<secret>`) are NOT operator
-secrets. They're minted via the management API after the first
-admin token is bootstrapped — see `AUTH.md` § "First-token
-bootstrap."
+### Chart value limitations
 
-## 8. Migrations
+The workload templates predate the current Rust config shape. Values retained
+for template compatibility but not honored by the binary are labeled in
+[`charts/knievel/values.yaml`](charts/knievel/values.yaml). In particular:
 
-Two paths:
+- `events.retentionDays`, `flushIntervalMs`, and `flushBatchSize` render under
+  `events`, but only `channelCapacity` maps to a Rust field. Runtime retention
+  comes from `partitions.retention_days`, which the chart does not expose.
+- `logging.decisionsSampleRate` is ignored.
+- the chart's Sentry and OTel blocks render at unsupported top-level keys and,
+  even in the Rust-recognized nesting, those integrations are stubbed;
+- no persistent image backend is configurable; and
+- `serviceMonitor.enabled` renders a `/metrics` scrape even though the server
+  has no `/metrics` route. Leave it false.
 
-1. **`auto_migrate: true`** (default). Knievel runs `sqlx::migrate!`
-   on startup before listening for traffic. Pod won't accept requests
-   until migrations are applied. Suitable for single-instance
-   deploys and rolling restarts where the first pod's migration is
-   the gate.
+These are disclosed limitations, not promises to implement them in the chart.
+The workload templates are unchanged by documentation-only corrections.
 
-2. **`auto_migrate: false`** + `knievel-cli migrate`. Run migrations
-   out-of-band from a Job (Helm hook) or a manual one-off. Suitable
-   for operators who want migration auditing separate from pod boot,
-   or who have multi-region deploys where one region runs migrations
-   and others wait for replication.
+## Admin surface
 
-Migrations are **additive only** (`REQUIREMENTS.md` § 6.4). The
-schema gets a new column, a new table, a new index — never a column
-removal in v0. The migration linter rejects RLS-incomplete migrations
-in CI (`xtask lint-migrations`).
+The release image sets `KNIEVEL_ADMIN_UI__STATIC_DIR` to the bundled admin
+assets, so `/admin/` is on by default. Unset or empty that variable for a
+headless server. `GET /admin/config.json` exposes only issuer, public client ID,
+scopes, and the `require_oidc` flag.
 
-## 9. Upgrades
+Both OIDC and pasted opaque tokens live in browser `sessionStorage`. Put the
+admin origin behind TLS and appropriate network/access controls. Same-origin
+script execution can steal the bearer; the server does not provide an HttpOnly
+cookie boundary. Set `adminUi.oidc.requireOidc=true` to hide the paste-token
+fallback after OIDC is configured.
 
-Knievel pods are stateless by design. Rolling restart story:
+## Probes and observability
 
-1. Apply migrations (auto on first boot, or out-of-band per § 8).
-2. Roll pods one at a time. The advisory-lock leader re-elects on
-   each pod loss; the snapshot loader catches up via poll within 5 s.
-3. Old pods drain via `/readyz` flipping 503 (the Helm chart's
-   default `terminationGracePeriodSeconds: 30` is enough).
+- `/healthz` means the process is serving HTTP.
+- `/readyz` runs `SELECT 1` when a pool exists. It does not verify snapshot or
+  event-flusher health. In allowed DB-less mode it returns 200 with a reason.
+- `/version` shows build metadata and effective auth issuer summaries.
+- `/openapi.json` serves the live generated spec.
+- `/metrics` does not exist.
 
-An Aurora failover during an upgrade looks like a 1–10 s blip in
-`/readyz` while the writer endpoint moves; the LB drains the affected
-pod, the snapshot loader's reconnect handler re-establishes
-LISTEN/NOTIFY, the poll backstop catches up. No state loss.
+Use structured stdout/stderr request logs as the working observability surface.
+Do not enable chart OTel/Sentry settings expecting export.
 
-## 10. Multi-region
+## Runtime and data caveats
 
-**Single-region in v0.** Cross-region active-active is out of scope
-— the snapshot's 5 s staleness window doesn't survive a cross-region
-hop, and the partition manager's leader election can't span regions
-either.
+### Snapshot freshness
 
-The Helm chart exposes `affinity` and `topologySpreadConstraints` for
-multi-AZ within a region. An active-passive operator pattern
-(primary region serves; secondary region is warm but not taking
-traffic; manual failover via DNS) is the recommended cross-region
-shape.
+Each pod cold-loads independently and polls `config_version` every five seconds.
+Writes do not bump that sequence. Restart pods after DB-direct provisioning or
+explicitly coordinate a sequence bump; a successful management write alone does
+not guarantee refresh.
 
-## 11. Observability setup
+### Event durability
 
-Three streams, all carrying the same `request_id` / `trace_id`:
+The queue is process memory. A flush executes per-row INSERTs; a DB failure logs
+and drops the current batch. Shutdown passes Poem a request-drain timeout but
+does not await the event flusher handle, and the parsed total timeout is not
+enforced. Plan capacity and deploy drains accordingly.
 
-- **Metrics**: scrape `/metrics` (Prometheus exposition format).
-  Default-low cardinality — no per-tenant metrics unless explicitly
-  enabled via `metrics.per_tenant_enabled: true`. The chart wires a
-  `ServiceMonitor` for the `prometheus-operator` flavor.
-- **Traces**: OTLP/gRPC to whatever endpoint `otel.endpoint` points
-  at. Default sampler is parent-based with a 10% root-sample rate;
-  override via `otel.sampler` if you want every-request tracing
-  during an investigation.
-- **Errors**: Sentry via `sentry-tower`. Per-request hub keeps
-  fingerprinting per-tenant. 5xx files an issue; 4xx and timeouts
-  don't.
+### Images
 
-`observability.logging.format: json` is the default and matches
-what container log aggregators expect. `format: compact` is the
-human-readable variant for `docker compose logs`.
+Uploads are process-local memory. They are unsuitable for persistent production
+creative hosting and break across restart or replica selection. Store durable
+image URLs externally and write those URLs through the creative API instead of
+relying on the upload operation.
 
-## 12. Alerts and dashboards
+### Retention
 
-Six operator-actionable thresholds (per `REQUIREMENTS.md` § 9.3).
-Sample PromQL alerts checked into `examples/observability/`:
+The partition manager is intended to detach old `events_raw` leaves; it does
+not drop them. Migration `0010`'s year-wide 2026 seed leaf overlaps the daily
+leaves the manager attempts during 2026, so the pass currently errors on CREATE
+before it reaches detachment. Repair the partition layout deliberately, then
+monitor detached tables and implement an operator-owned archive/drop policy.
+`events_rollup` has no automated retention.
 
-| Alert | Threshold | Likely cause |
-|---|---|---|
-| `knievel_decision_p99_high` | p99 > 50 ms for 5 min | Snapshot scaled past pod RAM; bump pod size or shard projects. |
-| `knievel_event_channel_drops` | `events.dropped` rate > 0 for 1 min | Channel capacity too small for traffic — bump `events.channelCapacity`. |
-| `knievel_db_connections_saturated` | pool wait time > 1 s | Connection budget too low; bump per-pod cap or scale pods. |
-| `knievel_snapshot_stale` | `snapshot.staleness_seconds > 30` | LISTEN dropped + poll backstop also failing. Investigate DB connectivity. |
-| `knievel_jwks_unreachable` | `auth.jwks_fetch_failures` > 0 for 5 min | JWKS endpoint outage — auth still works for cached keys, will degrade. |
-| `knievel_partition_creation_late` | newest partition < 1 day ahead of now | Leader stuck; check `partition.leader_changes` metric. |
+## Migrations and rollback
 
-Dashboards-as-code (Grafana JSON) live next to the alerts in
-`examples/observability/`.
+Migrations are bundled and forward-only. Prefer a pre-deploy migration job when
+your change-control process requires explicit DB ownership; otherwise
+`database.auto_migrate=true` runs them at pod boot. Multiple pods may attempt
+the same sqlx migration lock path, so stage rollout conservatively.
 
-## 13. Runbooks
+Application rollback means redeploying a prior image while leaving additive DB
+objects in place. Never edit or manually mark a shipped migration as reverted.
+Verify that the prior binary tolerates the additive schema before rollback.
 
-Stub each — flesh out once an incident actually happens. Living
-versions live in `examples/observability/runbooks/`.
+## Validation
 
-- **DB writer unreachable**: `/readyz` 503 → LB drains. Fix Postgres,
-  pods come back. No data loss for already-buffered events.
-- **Snapshot stale**: `snapshot.staleness_seconds > 30`. Restart the
-  affected pod; the new boot rebuilds the snapshot from scratch.
-- **Event channel saturated**: `events.dropped` ticking. Bump
-  `events.channelCapacity`; consider sharding by project.
-- **Leader maintenance failure**: advisory lock churn means the
-  leader is dropping ownership repeatedly. Symptom:
-  `partition.leader_changes` > 1 per hour. Investigate Postgres
-  connection stability.
-- **JWKS endpoint unreachable**: tokens minted before outage keep
-  working until cache TTL; new tokens 401. Fix upstream IdP,
-  knievel auto-recovers on next refresh.
-- **Connection-pool exhaustion**: handlers wait on the pool; p99
-  spikes. Either scale pods (add capacity), scale Postgres
-  connection limit, or shed load via the LB.
+Before deploying changed manifests:
 
-## 14. Troubleshooting
+```sh
+docker compose -f examples/compose/compose.yaml config
+helm lint --strict charts/knievel
+helm template knievel charts/knievel \
+  --set database.host=db.example \
+  --set database.name=knievel \
+  --set database.existingSecret=knievel-db \
+  --set api.publicBaseUrl=https://ads.example >/tmp/knievel-rendered.yaml
+```
 
-Short FAQ keyed off `error.code` values callers see:
-
-| Code | Means | Operator action |
-|---|---|---|
-| `no_db` | No `database.url` configured | Fix config; restart pod. |
-| `db_error` | Postgres returned an unexpected error | Check Postgres logs + connection budget. |
-| `forbidden` | RLS rejected the query | Caller's principal doesn't bind the right org/project. Verify the token. |
-| `invalid_cursor` | Pagination cursor is corrupt or for a different resource | Caller's bug. Confirm the cursor came from the right `list*` endpoint. |
-| `invalid_limit` | `?limit=N` outside `[1, 500]` | Caller's bug. |
-| `bad_signature` (event endpoints) | HMAC rotation window passed | If frequent, check that signing-secret rotation completed cleanly. |
-| `external_id_conflict` | POST hit a row with the same `external_id` | Caller should use `:batchUpsert` for idempotent writes. (POST-side parity moves to Phase 6.1.) |
-
-`API.md` § "Errors" has the full taxonomy.
-
-## 15. Decommissioning
-
-Drop in this order:
-
-1. **Stop traffic**: scale knievel deployment to 0 replicas (chart:
-   `replicaCount: 0`).
-2. **Final warehouse extract** (if needed): `COPY (SELECT … FROM
-   knievel.events_raw) TO …` per `REPORTING.md`.
-3. **Drop the schema**: `DROP SCHEMA knievel CASCADE`.
-4. **Drop the role**: `DROP ROLE knievel_app`. Same for
-   `knievel_reader` if you provisioned it.
-5. **Delete the secrets**: HMAC default secret, Sentry DSN, DB
-   password.
-6. **Helm uninstall**: `helm uninstall knievel`. Delete the namespace
-   if it was knievel-only.
-
-Object-store creative images persist independently — the operator
-owns the bucket lifecycle.
+A syntactically valid render does not prove that a rendered config field is
+consumed; compare the ConfigMap with [`src/config.rs`](src/config.rs).

@@ -28,7 +28,21 @@ export default defineConfig({
     // Build is assumed to have run already (CI does
     // `pnpm build` before invoking this config); preview is
     // Vite's static server on :4173.
-    command: 'pnpm preview --port 4173 --strictPort',
+    //
+    // --host 127.0.0.1 is load-bearing: without an explicit
+    // host, Vite resolves the string "localhost" via DNS to
+    // bind its listener. On GitHub Actions' ubuntu-latest
+    // runners /etc/hosts maps "localhost" to both 127.0.0.1
+    // and ::1, and Node's resolver can hand back the IPv6
+    // entry first — so the preview server ends up listening
+    // only on ::1 while this config's readiness probe (and
+    // BASE_URL above) hits the literal 127.0.0.1. The probe
+    // then gets ECONNREFUSED for the full timeout window with
+    // no diagnostic output, since the server never fails to
+    // start — it's just unreachable on the address being
+    // polled. Pinning both sides to the literal IPv4 address
+    // removes the DNS step entirely.
+    command: 'pnpm preview --host 127.0.0.1 --port 4173 --strictPort',
     url: BASE_URL,
     reuseExistingServer: !process.env.CI,
     timeout: 60_000,

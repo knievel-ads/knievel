@@ -123,6 +123,9 @@ importers:
       prettier:
         specifier: ^3.4.2
         version: 3.8.3
+      size-limit:
+        specifier: ^11.1.6
+        version: 11.2.0
       typescript:
         specifier: ^5.7.2
         version: 5.9.3

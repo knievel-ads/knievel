@@ -1,5 +1,11 @@
 # Knievel Documentation Plan
 
+> **Status — historical planning record.** This plan explains how the
+> documentation set was conceived; it is not the current navigation contract or
+> a freshness claim. Use [README.md](README.md), [AGENTS.md](AGENTS.md), and
+> [CODEMAP.md](CODEMAP.md) for maintained entry points. Preserve the material
+> below as planning history rather than treating unchecked work as a backlog.
+
 What we publish, who reads it, and how the docs hand off to each
 other so a reader can decide — confidently and quickly — whether
 knievel fits.

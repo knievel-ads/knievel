@@ -1,7 +1,7 @@
 //! `xtask bench-all` — comprehensive decision-bench orchestrator
 //! (Phase 5.9). Runs the criterion + iai-callgrind + dhat suite,
 //! captures host fingerprint via `xtask bench-env`, assembles
-//! `bench/results/v<MAJ>.<MIN>.json` matching
+//! `bench/results/v{MAJ}.{MIN}.json` matching
 //! `bench/results/SCHEMA.md`, and refreshes the corresponding
 //! `.md` entry from a template.
 //!
@@ -11,15 +11,15 @@
 //! historical record. Re-running on the same workspace version
 //! overwrites the in-progress entry idempotently.
 //!
-//! Optional `--against <prev>` reads
-//! `bench/results/v<prev>.json` and prints a regression diff
+//! Optional `--against PREVIOUS` reads
+//! `bench/results/v{PREVIOUS}.json` and prints a regression diff
 //! table (instructions, wall-clock, allocs). Output is for
 //! pasting into the commit message; not a hard fail.
 //!
 //! The bench section's contract is documented in `TESTING.md`
 //! § 8 and `bench/results/SCHEMA.md`. Don't add or rename
 //! signal keys here without updating both — the JSON shape
-//! is what makes v<X+1> diff cleanly against v<X>.
+//! is what makes `vX+1` diff cleanly against `vX`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -128,7 +128,7 @@ pub fn run(args: Args) -> Result<()> {
 // ---------- workspace version ----------
 
 /// Reads `version` from `[workspace.package]` and returns the
-/// `<major>.<minor>` slice. Bench results are tracked at minor
+/// `{major}.{minor}` slice. Bench results are tracked at minor
 /// granularity (`v0.1`, `v0.2`, ...); patch versions roll up
 /// into the same file.
 fn read_workspace_minor() -> Result<String> {
@@ -171,7 +171,7 @@ fn run_criterion(bench: &str) -> Result<()> {
     Ok(())
 }
 
-/// Walk `target/criterion/<group>/<bench>/new/estimates.json`
+/// Walk `target/criterion/{group}/{bench}/new/estimates.json`
 /// for every bench under a top-level group. Falls back to
 /// looking for the bench by name at the top level if no group
 /// directory exists.
@@ -265,7 +265,7 @@ fn run_iai(bench: &str) -> Result<()> {
 
 /// iai-callgrind writes `target/iai/...callgrind.out` files plus
 /// per-bench summary files. The summary lives at
-/// `target/iai/<crate>/<bench>/<group>/<name>/<id>/summary.json`
+/// `target/iai/{crate}/{bench}/{group}/{name}/{id}/summary.json`
 /// for v0.16.x. Walk the tree and pull the headline counters.
 fn collect_iai_stats() -> Result<Value> {
     let root = PathBuf::from("target/iai");

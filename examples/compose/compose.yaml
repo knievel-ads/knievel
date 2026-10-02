@@ -1,33 +1,17 @@
-# Knievel reference compose stack — Phase 4.1.
+# Knievel reference stack.
 #
-# `docker compose up` brings up a Postgres and a knievel server in
-# under a minute. The image either pulls from `ghcr.io/knievel-ads/knievel`
-# (default) or builds the local source tree (set the `KNIEVEL_BUILD`
-# env var to anything to flip the switch). Phase 4.3 publishes the
-# image; until then most contributors run with `KNIEVEL_BUILD=1`.
-#
-# Layout mirrors the canonical RX example in
-# `MIGRATION_RX.md` "Local Development for RX Engineers" — same
-# service names, same volume names, same healthcheck shape — so
-# a contributor can read the migration guide and the reference
-# stack interchangeably.
-#
-# `knievel-seed` is the seed-demo sidecar slot. Phase 4.2 lands
-# the actual `knievel-cli seed-demo` invocation; today it logs a
-# placeholder and exits 0 so `docker compose up` doesn't wedge
-# waiting on it.
+# The runtime Dockerfile packages prebuilt binaries; Compose does not compile
+# the repository. Build a local image with:
+#   cargo xtask build-image --tag knievel:local
+# then set KNIEVEL_IMAGE=knievel:local.
 
 name: knievel
 
 services:
   knievel-postgres:
     image: postgres:16
-    # Bootstrap as the default `postgres` superuser and have
-    # init.sql CREATE the app role NOSUPERUSER from the start.
-    # Postgres 16.13 rejects self-NOSUPERUSER (CLAUDE.md gotcha
-    # #17), so we can't bootstrap as `knievel_app` and then drop
-    # superuser; the same workaround is used by ci.yml's
-    # db-integ / api-contract / acceptance jobs.
+    # Bootstrap as postgres; init.sql creates knievel_app NOSUPERUSER from the
+    # start so RLS tests and local traffic do not silently bypass policies.
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -43,51 +27,26 @@ services:
       - "127.0.0.1:5432:5432"
 
   knievel:
-    # Default points at the published ghcr image. `KNIEVEL_IMAGE`
-    # overrides for a locally-built image or a digest pin:
-    #   KNIEVEL_IMAGE=knievel:local docker compose up
-    #   KNIEVEL_IMAGE=ghcr.io/knievel-ads/knievel@sha256:... docker compose up
-    #
-    # Local-image building no longer happens via `compose build`.
-    # The runtime Dockerfile is intentionally thin (just COPYs
-    # pre-built binaries in) so the cargo build is a debuggable
-    # bare step in `release.yml` and `cargo xtask build-image` —
-    # not a layer hidden inside a docker build. To produce a
-    # local image: `cargo xtask build-image -t knievel:local`.
-    image: ${KNIEVEL_IMAGE:-ghcr.io/knievel-ads/knievel:latest}
+    # The current release workflow maintains the mutable major tag `0` plus
+    # X.Y.Z, X.Y, and sha-<commit> tags. Override with a local image or an
+    # immutable repository@sha256:... reference when reproducibility matters.
+    image: ${KNIEVEL_IMAGE:-ghcr.io/knievel-ads/knievel:0}
     depends_on:
       knievel-postgres:
         condition: service_healthy
     environment:
       KNIEVEL_CONFIG: /etc/knievel/config.yaml
-      RUST_LOG: ${RUST_LOG:-info,sqlx=warn}
     volumes:
       - ./config.yaml:/etc/knievel/config.yaml:ro
     ports:
       - "8080:8080"
-    healthcheck:
-      # Distroless has no shell, but `knievel` itself ships
-      # `/healthz`. Use Postgres's host-based check via wget
-      # over the published port from the postgres container —
-      # but that's circular. Simpler: run the healthcheck via
-      # the knievel-postgres image which has psql + curl-style
-      # tools. For v0 we exec the healthcheck inside a separate
-      # service when needed; the docker-compose service-level
-      # healthcheck below relies on `start_period` and the
-      # depender's connection retry.
-      test: ["NONE"]
-      interval: 5s
-      retries: 30
 
   knievel-seed:
-    # Bootstrap fixture data on first compose-up. Reuses the same
-    # image as the server (multi-binary Cargo package — `knievel-cli`
-    # ships in /usr/local/bin alongside `knievel`). Connects to
-    # Postgres directly to bypass the auth chicken-and-egg, then
-    # writes the bearer to ./tmp/knievel-dev-token on the host.
-    # Idempotent — re-running compose up after data exists is a
-    # no-op apart from a hash-rotation if --token is supplied.
-    image: ${KNIEVEL_IMAGE:-ghcr.io/knievel-ads/knievel:latest}
+    # Manually invoked one-shot tool. Run it only after /healthz is available,
+    # and pass the host UID/GID so ../../tmp/knievel-dev-token is writable and
+    # host-owned:
+    #   docker compose run --rm --user "$(id -u):$(id -g)" knievel-seed
+    image: ${KNIEVEL_IMAGE:-ghcr.io/knievel-ads/knievel:0}
     depends_on:
       knievel-postgres:
         condition: service_healthy
@@ -102,15 +61,7 @@ services:
       DATABASE_URL: postgres://knievel_app:dev@knievel-postgres:5432/knievel?sslmode=disable
     volumes:
       - ../../tmp:/out
-    # seed-demo and the knievel server both depend on
-    # knievel-postgres being healthy, but seed-demo can race ahead
-    # of the server's `auto_migrate: true` and hit
-    # `relation "knievel.organizations" does not exist`. Knievel's
-    # distroless image precludes a docker healthcheck we could
-    # `depends_on: condition: service_healthy` against — so let
-    # docker restart seed-demo on failure. It's idempotent and
-    # converges within a couple of seconds once migrations land.
-    restart: on-failure
+    restart: "no"
 
 volumes:
   knievel-pgdata:

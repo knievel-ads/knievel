@@ -1,105 +1,109 @@
-# Knievel reference compose stack
+# Knievel reference Compose stack
 
-Phase 4.1 deliverable. `docker compose up` boots Postgres + knievel
-in under a minute against either the published
-`ghcr.io/knievel-ads/knievel:latest` image (default) or a locally-built
-image (set `KNIEVEL_BUILD=1`).
+This stack runs PostgreSQL 16, the release image (or a local override), and a
+manually invoked demo seeder. The canonical end-to-end command sequence is also
+in the root [README](../../README.md).
 
-## Quick start
+## Start and seed
 
-```bash
-cd examples/compose
-docker compose up
-# in another terminal:
-curl -fsS http://localhost:8080/healthz
-curl -fsS http://localhost:8080/readyz
-curl -fsS http://localhost:8080/version
+Run from the repository root so `tmp/` is the same host path mounted into the
+seeder:
+
+```sh
+mkdir -p tmp
+
+docker compose -f examples/compose/compose.yaml up -d \
+  knievel-postgres knievel
+
+until curl -fsS http://localhost:8080/healthz; do sleep 2; done
+
+seed_out="$(docker compose -f examples/compose/compose.yaml run --rm \
+  --user "$(id -u):$(id -g)" knievel-seed)"
+printf '%s\n' "$seed_out"
 ```
 
-`/healthz` returns `200 ok` once the binary is listening; `/readyz`
-goes green after the DB pool is up and migrations have applied.
+Waiting for `/healthz` before seeding ensures server-side migrations have
+created the schema. Running as the host UID/GID ensures
+`tmp/knievel-dev-token` is writable and remains host-owned.
 
-## Building from source
+The CLI prints every generated/reused ID. Capture at least `project_id`,
+`site_id`, and `ad_type_id`; do not assume they are `1`:
 
-The published image lands with Phase 4.3. Until then, build
-locally:
-
-```bash
-KNIEVEL_BUILD=1 docker compose build
-KNIEVEL_BUILD=1 docker compose up
+```sh
+PROJECT_ID="$(printf '%s\n' "$seed_out" |
+  sed -n 's/^seed-demo: .* project_id=\([^ ]*\)$/\1/p')"
+SITE_ID="$(printf '%s\n' "$seed_out" |
+  sed -n 's/^  creative_id=.* site_id=\([^ ]*\) zone_id=.*/\1/p')"
+AD_TYPE_ID="$(printf '%s\n' "$seed_out" |
+  sed -n 's/^  priority_id=.* ad_type_id=\([^ ]*\)$/\1/p')"
+TOKEN="$(cat tmp/knievel-dev-token)"
 ```
 
-The build context is the repo root; the `Dockerfile` produces a
-distroless `cc:nonroot` image with the `knievel` binary at
-`/usr/local/bin/knievel`. First build takes a few minutes
-(downloads + compiles every workspace dep); rebuilds reuse the
-dependency layer.
+`seed-demo` writes directly to PostgreSQL. Current management/CLI writes do not
+bump `config_version`, so the already-running server will not poll the new rows.
+Restart it to force a cold snapshot load:
 
-## Switching to a pinned digest
-
-Production deployments should pin to a specific image digest, not
-`:latest`:
-
-```bash
-KNIEVEL_IMAGE=ghcr.io/knievel-ads/knievel@sha256:... docker compose up
+```sh
+docker compose -f examples/compose/compose.yaml restart knievel
+until curl -fsS http://localhost:8080/healthz; do sleep 2; done
+sleep 1
 ```
 
-Phase 4.3 publishes images **on semver tags only** (no main-branch
-pushes — every published image is a deliberate release). After
-the first release, `ghcr.io/knievel-ads/knievel:vX.Y.Z` is the immutable
-tag; `ghcr.io/knievel-ads/knievel:latest` re-points to the freshest semver
-release. Pre-release work pins to a digest from a `vX.Y.Z-rc.N`
-tag or builds locally via `KNIEVEL_BUILD=1`.
+Issue a decision using the printed values and require a non-empty placement:
 
-## Layout
+```sh
+DECISION="$(curl -fsS -X POST \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H 'Content-Type: application/json' \
+  --data "{\"placements\":[{\"id\":\"header\",\"site_id\":${SITE_ID},\"ad_types\":[${AD_TYPE_ID}]}]}" \
+  "http://localhost:8080/v1/projects/${PROJECT_ID}/decisions")"
 
+printf '%s\n' "$DECISION"
+printf '%s' "$DECISION" | python3 -c \
+  'import json, sys; assert json.load(sys.stdin)["decisions"]["header"]'
 ```
+
+A `snapshot_cold` response means the asynchronous cold load lost the race; wait
+a second and retry.
+
+## Local image
+
+The Dockerfile is runtime-only. Compose build syntax is therefore not the local
+build path. Build binaries, the admin UI, and the image through xtask:
+
+```sh
+cargo xtask build-image --tag knievel:local
+KNIEVEL_IMAGE=knievel:local \
+  docker compose -f examples/compose/compose.yaml up -d \
+  knievel-postgres knievel
+```
+
+The default image is the mutable `0` major tag. For a controlled run, override
+`KNIEVEL_IMAGE` with `ghcr.io/knievel-ads/knievel@sha256:<digest>`.
+
+## Files
+
+```text
 examples/compose/
-  compose.yaml      # Postgres + knievel + (stubbed) seed sidecar
-  config.yaml       # mounted at /etc/knievel/config.yaml
-  init.sql          # one-time DB bootstrap (schema + pgcrypto)
-  README.md         # this file
+├── compose.yaml   # PostgreSQL, server, and one-shot seeder definitions
+├── config.yaml    # effective Rust config fields for local use
+├── init.sql       # non-superuser app role and loader-role bootstrap
+└── README.md
 ```
 
-This mirrors the canonical RX example in
-`MIGRATION_RX.md` "Local Development for RX Engineers" — same
-service names, same volume names, same healthcheck shape — so
-you can read either file and recognize the structure.
+The dev bootstrap grants broad default table writes to `knievel_loader` so the
+rollup works after auto-migration. Production should use the narrower grants in
+[DEPLOYMENT.md](../../DEPLOYMENT.md).
 
-## Common workflows
+## Inspect and stop
 
-- **Wipe and start over:** `docker compose down -v` drops the
-  Postgres volume; the next `up` re-runs `init.sql` and
-  re-applies migrations from a clean slate.
-- **Inspect Postgres:** `docker compose exec knievel-postgres
-  psql -U knievel_app -d knievel`.
-- **Tail logs:** `docker compose logs -f knievel`.
+```sh
+docker compose -f examples/compose/compose.yaml logs -f knievel
+docker compose -f examples/compose/compose.yaml exec knievel-postgres \
+  psql -U knievel_app -d knievel
 
-## Seeding the demo data
-
-`knievel-seed` runs `knievel-cli seed-demo` once on first compose
-up — connects to Postgres directly, idempotently provisions an
-org / project / advertiser / campaign / flight / ad / creative /
-site / zone, and writes a fixed dev bearer to
-`./tmp/knievel-dev-token` (path is `examples/compose/../../tmp/`,
-i.e. the repo root's `tmp/`). Re-running compose up after data
-already exists is a no-op apart from a hash rotation on the
-bootstrap token.
-
-```bash
-docker compose up                         # one-shot bootstrap
-TOKEN=$(cat ../../tmp/knievel-dev-token)  # the demo bearer
-curl -fsS -X POST http://localhost:8080/v1/projects/<pj>/decisions \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"placements": [{"id": "header", "ad_type_id": <id>}]}'
+docker compose -f examples/compose/compose.yaml down -v
 ```
 
-The project and ad-type ids are printed on the seed-demo log line:
-`docker compose logs knievel-seed`.
-
-## Refs
-
-- `REQUIREMENTS.md` § 8 (Deliverables, Compose manifest is item 7)
-- `MIGRATION_RX.md` "Local Development for RX Engineers"
-- `TESTING.md` § 11.1 (`seed-demo` as the canonical fixture)
+Uploaded creative images are process-local memory and disappear on restart.
+There is no `/metrics` endpoint, OTel exporter, or Sentry SDK in this stack.

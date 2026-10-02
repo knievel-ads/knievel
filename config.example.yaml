@@ -1,241 +1,83 @@
-# Knievel reference configuration.
+# Knievel configuration matching src/config.rs.
 #
-# The running config is built by layering, in order of increasing precedence:
-#   1. Built-in defaults (compiled in).
-#   2. This file (path from $KNIEVEL_CONFIG, default /etc/knievel/config.yaml).
-#   3. Individual env-var overrides (KNIEVEL_*).
-#
-# `${VAR}` and `${VAR:default}` placeholders are expanded from the process
-# environment before YAML parsing. Unset `${VAR}` with no default is a hard
-# startup error.
+# Precedence: Rust defaults < this file < KNIEVEL_ environment overrides.
+# Nested environment keys use a double underscore. Dollar-brace environment
+# interpolation runs over the raw file before YAML parsing; an unset reference
+# without a fallback is a startup error.
 
 api:
   bind_addr: 0.0.0.0:8080
-  # Used to mint absolute impression/click URLs in decision responses.
-  public_base_url: ${KNIEVEL_PUBLIC_BASE_URL}
-  # Origins permitted to make cross-origin requests. Empty disables
-  # the CORS layer entirely (same-origin only — fine when the admin
-  # UI is served from this same hostname). List literal origins
-  # explicitly when the admin UI is served from a different origin;
-  # wildcards are not supported. Consumed by the Phase 7 CORS
-  # middleware (see UI.md, "CORS").
+  # Parsed and required in this typed block, but currently NOT applied to
+  # click_url/impression_url; decision responses contain relative /e/... paths.
+  public_base_url: ${KNIEVEL_PUBLIC_BASE_URL:http://localhost:8080}
+  # Empty means no CORS middleware. Use literal origins; wildcards are not
+  # supported and credentials remain disabled.
   allowed_origins: []
-  # Example for local dev with the Vite dev server on :5173:
-  # allowed_origins:
-  #   - http://localhost:5173
-  #   - http://127.0.0.1:5173
+  shutdown_drain_timeout_secs: 30
+  # Parsed, but current shutdown enforcement passes only the drain timeout to
+  # poem. This total budget is not enforced yet.
+  shutdown_total_timeout_secs: 60
 
 database:
-  # Cluster writer endpoint. LISTEN/NOTIFY does NOT propagate to readers,
-  # so a reader endpoint silently breaks snapshot refresh.
-  url: postgres://knievel_app:${DB_PASSWORD}@${DB_HOST}:${DB_PORT:5432}/${DB_NAME}?sslmode=require
-  schema: knievel
+  url: postgres://knievel_app:${DB_PASSWORD}@${DB_HOST}:${DB_PORT:5432}/${DB_NAME:knievel}?sslmode=${DB_SSLMODE:require}
   max_connections: 8
-  flusher_connections: 2
-  # Run sqlx migrations at startup. Knievel keeps migrations small and
-  # additive; impactful ones are flagged in release notes.
   auto_migrate: true
-  # When true (default), a missing or unreachable database causes the
-  # process to exit 1 at boot → CrashLoopBackOff on Kubernetes.
-  # Set to false only in dev environments where you want the server to
-  # start without a database (project-scoped endpoints will 503).
   required: true
-  # Exponential-backoff retry on the initial connection. The server
-  # retries `attempts` times before treating the failure as fatal.
   connect_retry:
     attempts: 5
     initial_backoff_ms: 1000
     max_backoff_ms: 16000
 
-snapshot:
-  # Notify + version-poll hybrid. NOTIFY is the fast path; the poll
-  # backstops it when Postgres' NOTIFY queue drops messages or Aurora
-  # failovers drop the listener.
-  poll_interval_seconds: 5
-
-images:
-  # Object storage backend for creative image assets.
-  storage:
-    backend: s3
-    bucket:  ${KNIEVEL_IMAGE_BUCKET}
-    region:  ${KNIEVEL_IMAGE_REGION:us-east-1}
-    # Path-style for MinIO / non-AWS S3-compatible.
-    endpoint:    ${KNIEVEL_IMAGE_ENDPOINT:}
-    path_style:  ${KNIEVEL_IMAGE_PATH_STYLE:false}
-    access_key:  ${KNIEVEL_IMAGE_ACCESS_KEY}
-    secret_key:  ${KNIEVEL_IMAGE_SECRET_KEY}
-  upload:
-    max_bytes: 41943040    # 40 MiB
-    allowed_mime_types:
-      - image/jpeg
-      - image/png
-      - image/gif
-      - image/webp
-      - image/avif
-
-events:
-  # Bounded for shared-cluster deployments where backups include our data.
-  retention_days: 30
-  flush_interval_ms: 1000
-  flush_batch_size: 5000
-  # Channel saturation surfaces as 503 on the decision endpoint.
-  channel_capacity: 100000
-
-decisions:
-  # Global kill-switch for force.* decision overrides. With this off,
-  # any decision request carrying force.* fails fast at 403 even if
-  # the per-project allow_force_decision flag is on. Useful for
-  # incident response.
-  force_overrides_enabled: true
-
-audit:
-  # audit_log retention (privileged operations, separate from
-  # events_raw). Partitioned monthly.
-  retention_days: 365
-
-partitions:
-  # Knievel manages its own partitions in-process from a leader-elected
-  # tokio task. No pg_partman, no pg_cron, no external scheduler.
-  maintenance_interval_seconds: 3600
-  # Always keep this many days of future partitions ahead of `now()`.
-  # With hourly maintenance, a leader outage of up to ~4 days is
-  # harmless.
-  premake_days: 4
-  # Leader-election follower poll interval — how long after the
-  # current leader's session ends a follower will pick up the work.
-  follower_poll_seconds: 30
-  # Watchdog: if no maintenance run completes in this window, the
-  # process exits (releasing the advisory lock and triggering a
-  # re-election somewhere else).
-  watchdog_hours: 6
-
-hmac:
-  # Per-project HMAC secrets are server-generated at project creation.
-  # This `default_secret` only seeds the server-internal entropy pool
-  # for new projects; it is never used directly to sign URLs.
-  default_secret: ${KNIEVEL_HMAC_DEFAULT_SECRET}
-  # On rotation (PATCH /v1/orgs/{orgId}/projects/{projectId}), accept
-  # both the new and the previous secret as verifiers for this many
-  # hours so already-minted impression/click URLs stay valid.
-  rotation_overlap_hours: 8
-
-auth:
-  # Which credential modes to accept on Management/Decision endpoints.
-  # Either or both can be enabled. Detection is by Bearer prefix:
-  # opaque tokens start with `kvl_`; everything else parses as JWT.
-  modes: [opaque, jwt]
-
-  jwt:
-    # One or more trusted issuers. The first whose `iss` claim matches
-    # is used. JWKS is auto-discovered from
-    # {issuer}/.well-known/openid-configuration unless `jwks_url` is
-    # set explicitly.
-    issuers:
-      # Keycloak: rich JWT carrying a `knievel` claim minted by a
-      # protocol mapper. See AUTH.md.
-      - issuer:    ${KNIEVEL_JWT_ISSUER:}
-        audience:  ${KNIEVEL_JWT_AUDIENCE:knievel}
-        jwks_url:  ""
-        # `alg: none` and HMAC variants are always rejected; this list
-        # narrows the asymmetric algorithms we'll accept.
-        algorithms: [RS256, ES256]
-        # Where the knievel claim lives in the JWT.
-        claim:        knievel
-        # `object` (default): single nested {scope, org_id, ...} object.
-        # `flat`: separate top-level claims (knievel_scope, knievel_org_id, ...).
-        claim_format: object
-        cache_ttl_seconds:  3600
-        clock_skew_seconds: 30
-
-      # Kubernetes ServiceAccount tokens: zero-trust, in-cluster.
-      # The cluster's API server is the issuer; pods send their
-      # projected SA token as Bearer; knievel maps `sub` -> principal.
-      # See AUTH.md "Kubernetes ServiceAccount Tokens".
-      - issuer:    https://kubernetes.default.svc.cluster.local
-        audience:  knievel
-        algorithms: [RS256]
-        claim_mapping:
-          rules:
-            - match:
-                sub: system:serviceaccount:rx-prod:knievel-client
-              principal:
-                scope:   org
-                org_id:  scientist-com-prod
-                role:    editor
-            - match:
-                sub: system:serviceaccount:rx-staging:knievel-client
-              principal:
-                scope:   org
-                org_id:  scientist-com-staging
-                role:    editor
-
-metrics:
-  # Per-project metrics are off by default to keep cardinality low.
-  # Add specific project IDs here when investigating a tenant; emit
-  # is parallel (default series stay published either way). Remove
-  # to stop the per-project labels.
-  per_project_projects: []
-
 logging:
   level: ${KNIEVEL_LOG_LEVEL:info}
   format: json
-  decisions_sample_rate: 0.01
-  # Per-request structured log line + x-request-id response header
-  # (Phase 4.12). Default true. The line carries
-  # method/path/status/latency_ms/request_id; 5xx logs at ERROR
-  # with the inner error chain attached, slow-but-OK requests bump
-  # to WARN. Set to false on hot-path-only fleets that ship
-  # per-request observability via OTel spans instead.
   request_log_enabled: true
-  # Exact-match path skip-list. Default skips probe traffic; add
-  # the decision endpoint here on high-QPS deploys if the per-
-  # request line is too noisy.
   request_log_skip_paths:
     - /healthz
     - /readyz
-  # Latency above which requests log at WARN regardless of status.
   request_log_slow_ms: 1000
 
-tracing:
-  otel:
-    enabled: true
-    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://otel-collector:4317}
-    service_name: knievel
-    resource_attributes:
-      service.namespace: ${SERVICE_NAMESPACE:default}
-      deployment.environment: ${KNIEVEL_ENV:production}
+events:
+  # The only effective events config field today. Flush interval and batch size
+  # are constants in src/events.rs.
+  channel_capacity: 8192
 
-errors:
-  sentry:
-    # Empty DSN disables Sentry entirely (useful for local dev).
-    enabled: true
-    dsn: ${SENTRY_DSN:}
-    environment: ${KNIEVEL_ENV:production}
-    release: ${KNIEVEL_RELEASE:}
-    sample_rate: 1.0
-    # Performance/tracing live in OTel; Sentry is for errors only.
-    traces_sample_rate: 0.0
+decisions:
+  force_overrides_enabled: true
 
-shutdown:
-  drain_timeout_seconds: 30
-  total_timeout_seconds: 60
+partitions:
+  # Attached events_raw leaves older than this are detached, not dropped.
+  retention_days: 30
+
+# Opaque DB-backed authentication remains active regardless of this list.
+# A non-empty issuer list additionally enables JWT-shaped bearer verification.
+# See AUTH.md for the exact issuer fields and the RSA-only runtime caveat.
+auth:
+  jwt:
+    issuers: []
 
 admin_ui:
-  # Filesystem path for the SPA bundle. When set, poem mounts it at
-  # /admin/ via StaticFilesEndpoint (Phase 7.11). Empty / unset =
-  # headless API; /admin/* returns 404. Common production override:
-  #   KNIEVEL_ADMIN_UI__STATIC_DIR=/var/lib/knievel/admin
-  static_dir: ${KNIEVEL_ADMIN_UI_STATIC_DIR:}
-
-  # OIDC public-client metadata. Surfaced verbatim to the SPA at
-  # GET /admin/config.json so one bundle works across envs. No
-  # client secret here — PKCE replaces it. See AUTH.md "Keycloak
-  # Setup — Human Admin UI (PKCE)" and UI.md "Auth".
+  # Empty disables the static /admin/ mount. Release images set the nested env
+  # override to /var/lib/knievel/admin by default.
+  static_dir: "${KNIEVEL_ADMIN_UI_STATIC_DIR:}"
   oidc:
-    issuer:    ${KNIEVEL_ADMIN_UI_OIDC_ISSUER:}
-    client_id: ${KNIEVEL_ADMIN_UI_OIDC_CLIENT_ID:}
-    scopes:    [openid, profile, knievel]
-    # When true, the SPA hides the paste-a-token fallback so
-    # SSO/MFA/audit policy can't be sidestepped. Defaults to
-    # false so dev / no-Keycloak deployments still have a way in.
+    issuer: "${KNIEVEL_ADMIN_UI_OIDC_ISSUER:}"
+    client_id: "${KNIEVEL_ADMIN_UI_OIDC_CLIENT_ID:}"
+    scopes: [openid, profile, knievel]
     require_oidc: false
+
+# Parsed but stubbed: enabling this only logs a message. No OTel exporter is
+# installed in the current binary.
+tracing:
+  otel:
+    enabled: false
+    endpoint: "${OTEL_EXPORTER_OTLP_ENDPOINT:}"
+    service_name: knievel
+
+# Parsed but stubbed: enabling this only logs a message. No Sentry SDK is
+# installed in the current binary.
+errors:
+  sentry:
+    enabled: false
+    dsn: "${SENTRY_DSN:}"
+    environment: "${KNIEVEL_ENV:}"

@@ -1,44 +1,46 @@
-# Knievel config for the reference compose stack — Phase 4.1.
-#
-# Layered loader semantics (`REQUIREMENTS.md` § 10.1):
-#   1. Built-in defaults.
-#   2. This file (mounted at /etc/knievel/config.yaml).
-#   3. KNIEVEL_* env-var overrides.
-#
-# Env-var interpolation runs against the process environment
-# before parse (dollar-brace syntax), so you can keep the password
-# in compose's environment block instead of rebaking the YAML.
-# Note: the loader scans the entire file text — including comment
-# bodies — so don't write a literal placeholder here unless the
-# referenced env var is always set.
+# Effective configuration for the reference Compose stack.
+# The file is mounted at /etc/knievel/config.yaml.
 
 api:
   bind_addr: 0.0.0.0:8080
+  # Required by ApiConfig. The current decision builder still returns relative
+  # /e/... tracking paths; this value is parsed but not applied there.
   public_base_url: http://localhost:8080
+  allowed_origins: []
+  shutdown_drain_timeout_secs: 30
+  # Parsed but not enforced by current shutdown code.
+  shutdown_total_timeout_secs: 60
 
 database:
   url: postgres://knievel_app:dev@knievel-postgres:5432/knievel?sslmode=disable
-  schema: knievel
-  auto_migrate: true
   max_connections: 8
+  auto_migrate: true
+  required: true
+  connect_retry:
+    attempts: 5
+    initial_backoff_ms: 1000
+    max_backoff_ms: 16000
 
 logging:
   level: info
   format: json
+  request_log_enabled: true
+  request_log_skip_paths:
+    - /healthz
+    - /readyz
+  request_log_slow_ms: 1000
 
-# Force-override kill switch (`API.md` § 1). Keep enabled in dev so
-# the per-project `allow_force_decision` flag stays the gate;
-# operators flip this to false in production for a process-wide
-# block.
 decisions:
   force_overrides_enabled: true
 
-# Events flusher capacity (`REQUIREMENTS.md` § 7.6). Default sized
-# for ~5k events/s with a 1s drain.
 events:
   channel_capacity: 8192
 
-# `events_raw` partition retention (`REQUIREMENTS.md` § 7.4).
-# Spec default; tune per environment.
 partitions:
+  # Old leaves are detached, not dropped.
   retention_days: 30
+
+auth:
+  jwt:
+    # Empty keeps this stack opaque-only. Opaque mode has no disable switch.
+    issuers: []

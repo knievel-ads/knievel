@@ -1,507 +1,294 @@
-# Knievel Reporting
+# Knievel reporting contract
 
-Knievel's data model is shaped to make downstream reporting easy.
-The expected pattern is **dbt running against the same Postgres
-cluster**, reading from `knievel.*` schemas alongside the operator's
-existing analytics tables. No ETL hop, no separate warehouse, no
-JSON unpacking.
+This document describes the tables created by
+[`migrations/0010_events_raw.sql`](migrations/0010_events_raw.sql) and
+[`migrations/0011_events_rollup.sql`](migrations/0011_events_rollup.sql), plus
+the current writers in [`src/events.rs`](src/events.rs) and
+[`src/rollup.rs`](src/rollup.rs). It does not describe a built-in reporting HTTP
+API; none ships.
 
-This document covers the access pattern, the schema for reporters,
-and worked dbt examples mapping `knievel.events_raw` into a typical
-medallion layout.
+## Important operational truth
 
-For the design context — why partitioned events, what's in
-`events_rollup`, the in-process partition manager — see
-`REQUIREMENTS.md` §7.
+- Events are buffered in process memory.
+- The flusher batches in memory but executes one GUC bind and one SQL INSERT per
+  row inside a transaction. Legacy comments calling this COPY are inaccurate.
+- Failed flushes are logged and the batch is dropped; there is no durable queue.
+- Raw leaves are detached at retention, not dropped.
+- The rollup table is named `knievel.events_rollup`, not
+  `events_rollup_hourly`.
+- Replay dedup is timestamp-sensitive because the actual unique constraint
+  includes `ts`. Do not treat `is_duplicate` as a billing-grade guarantee.
 
-## Why this is efficient
+## Event kinds
 
-Knievel writes events as plain typed rows into a daily-partitioned
-table. The expensive things — JSON unpacking, cross-database ETL,
-schema drift — don't apply.
+The `smallint` values are fixed by `src/events.rs` and the migration:
 
-- **Same Postgres cluster.** dbt models read `knievel.*` like any
-  other source. No Fivetran, no `pg_dump`, no warehouse sync. Joins
-  to operator-owned tables in `public.*` (or wherever) are local.
-- **Daily partitions on `ts`.** A dbt incremental model filtered to
-  yesterday's data scans one partition. A 7-day backfill scans 7.
-  Queries that don't filter by `ts` would scan everything — but
-  reporting queries always filter by time, so partition pruning is
-  always in play.
-- **No secondary indexes on `events_raw`.** Indexes would slow the
-  `COPY` ingest path on knievel's side, and partition pruning makes
-  them unnecessary for the reporting workload. If a specific report
-  is slow, the dbt model materializes it (bronze → silver → gold);
-  the gold layer is where you index, not the source.
-- **Append-only.** Bronze incremental models use `WHERE ts >
-  max(ts)` and are wrong-by-zero — no late updates, no UPSERTs to
-  reconcile.
-- **Typed columns.** Every event field is a typed column. No
-  `event_payload->>'foo'` casting; the column either exists or it
-  doesn't.
-- **Stable schema.** New event kinds = new rows in the same shape.
-  New columns = additive only, behind sqlx migrations. No breaking
-  schema changes without a major version bump.
-
-## Access Pattern
-
-Reporting consumers (dbt, BI tools, ad-hoc analysts) connect using
-a dedicated **read-only Postgres role**, separate from the
-`knievel_app` role knievel itself uses.
-
-```sql
--- One-time, run by a superuser (or via IaC).
-CREATE ROLE knievel_reader;
-
-GRANT USAGE ON SCHEMA knievel TO knievel_reader;
-GRANT SELECT ON ALL TABLES IN SCHEMA knievel TO knievel_reader;
-
--- Cover future tables (new partitions, new dimensions in migrations).
-ALTER DEFAULT PRIVILEGES FOR ROLE knievel_app IN SCHEMA knievel
-  GRANT SELECT ON TABLES TO knievel_reader;
-```
-
-Then grant `knievel_reader` membership to the actual analytics user:
-
-```sql
--- The dbt service account, or your warehouse user, or whoever.
-GRANT knievel_reader TO dbt_service;
-```
-
-Knievel itself never reads through `knievel_reader`. It exists
-purely so the operator can give the dbt pipeline `SELECT` access
-without giving it any chance to mutate knievel state.
-
-In a shared-cluster deployment (knievel and the host application
-share a Postgres cluster, like RX in `MIGRATION_RX.md`), `dbt_service`
-is the existing dbt role with one extra grant added.
-
-### Reading from a replica
-
-Aurora and most managed Postgres support read replicas. Point heavy
-dbt jobs at the **reader endpoint** to keep the writer's I/O budget
-focused on knievel's hot path. Replica lag is typically sub-second
-and well within the cadence of any dbt schedule.
-
-(Reminder: knievel itself MUST connect to the writer endpoint —
-`LISTEN/NOTIFY` doesn't propagate to readers. dbt has the opposite
-constraint.)
-
-## Schema for Reporters
-
-The interesting tables for reporting:
-
-### `knievel.events_raw` (fact source)
-
-Append-only, partitioned by day on `ts`. One row per event of any
-kind.
-
-| Column | Type | Notes |
+| Value | Kind | Producer |
 |---|---|---|
-| `ts` | `timestamptz` | Partition key. Event time. |
-| `org_id` | `bigint` | |
-| `project_id` | `bigint` | |
-| `kind` | `smallint` | Enum: `1=decision`, `2=impression`, `3=click`. |
-| `placement_id` | `text` | The caller-supplied placement id. |
-| `site_id` | `bigint` | |
-| `zone_id` | `bigint` | Nullable. |
-| `ad_id` | `bigint` | Nullable on `decision` rows that selected nothing. |
-| `creative_id` | `bigint` | |
-| `flight_id` | `bigint` | |
-| `campaign_id` | `bigint` | |
-| `advertiser_id` | `bigint` | |
-| `url` | `text` | From decision-time `context.url`. |
-| `referrer_host` | `text` | Hostname only. |
-| `user_agent_hash` | `bytea` | Hash, not raw UA. |
-| `signature_nonce` | `bytea` | Per-event nonce; useful as a unique key. |
-| `dedup_key` | `bytea` | Stable per (event, signature) for replay dedup. Unique within `(project_id, kind, dedup_key)`. |
-| `is_duplicate` | `bool` | `false` for the first hit of a given `(kind, dedup_key)`; `true` for any subsequent hits. **Canonical billable / reportable count is `count(*) WHERE NOT is_duplicate`.** Raw counts (including duplicates) are available against `events_raw` directly when traffic-volume analysis is wanted. `events_rollup` aggregates the non-duplicate count only. |
-| `snapshot_version` | `bigint` | Monotonic config version that produced the decision; lets you reproduce a decision deterministically. |
+| `0` | decision | A selected ad from the decision handler. |
+| `1` | impression | A successfully verified `/e/i/{signed}` request. |
+| `2` | click | A successfully verified `/e/c/{signed}` request. |
 
-**Default retention:** 30 days. Rolling reports older than that
-must materialize their own retention in dbt.
+Older examples using `1/2/3` or string kinds do not match storage.
 
-### `knievel.events_rollup` (pre-aggregated facts)
+## `knievel.events_raw`
 
-Hourly aggregates by `(project_id, site_id, zone_id, flight_id,
-ad_id, creative_id, kind)`, computed by knievel's leader-elected
-job before raw partitions age out. Indefinite retention.
+`events_raw` is range-partitioned on `ts`. Its parent schema is:
 
-| Column | Type |
+| Column | PostgreSQL type | Current producer semantics |
+|---|---|---|
+| `id` | `bigserial` | Part of the `(id, ts)` primary key. |
+| `ts` | `timestamptz` | Event timestamp; partition key. |
+| `org_id` | `text` | Owning organization. |
+| `project_id` | `text` | Owning project. |
+| `kind` | `smallint` | `0`, `1`, or `2` as above. |
+| `placement_id` | `text` nullable | Present on decision rows; pings carry only its signed hash. |
+| `site_id` | `bigint` nullable | Present on decisions, absent on current ping rows. |
+| `zone_id` | `bigint` nullable | First requested zone on decision rows. |
+| `ad_id` | `bigint` nullable | Selected/signed ad. |
+| `creative_id` | `bigint` nullable | Attached/signed creative; zero is converted to null for pings. |
+| `flight_id` | `bigint` nullable | Present on decision rows. |
+| `campaign_id` | `bigint` nullable | Present on decision rows. |
+| `advertiser_id` | `bigint` nullable | Present on decision rows. |
+| `url` | `text` nullable | Decision `context.url`. |
+| `referrer_host` | `text` nullable | Host extracted from decision referrer. |
+| `user_agent_hash` | `bytea` nullable | SHA-256 of decision user agent. |
+| `signature_nonce` | `bytea` nullable | Decision/signature nonce. |
+| `dedup_key` | `bytea` nullable | HMAC-derived for impression/click; null for decisions. |
+| `snapshot_version` | `bigint` nullable | Snapshot sequence value observed by producer. |
+| `is_duplicate` | `boolean` | Defaults false; conflict path sets true. |
+
+RLS binds this table by `org_id`, not project ID. Query the partitioned parent
+with a time predicate to get partition pruning and the parent policy.
+
+### Timestamp-sensitive dedup caveat
+
+The intended logical key is `(project_id, kind, dedup_key)`, but PostgreSQL
+requires a unique constraint on a partitioned table to include its partition
+key. The shipped constraint is:
+
+```sql
+UNIQUE (project_id, kind, dedup_key, ts)
+```
+
+The flusher uses:
+
+```sql
+ON CONFLICT (project_id, kind, dedup_key, ts)
+DO UPDATE SET is_duplicate = true
+```
+
+A replayed ping receives a new `ts_ms` in the event endpoint. Unless both hits
+share the exact stored timestamp, they are distinct unique keys and both remain
+`is_duplicate=false`. `dedup_key` is useful for downstream grouping, but
+`WHERE NOT is_duplicate` alone does not currently remove replays across
+timestamps.
+
+For downstream canonicalization, choose a business window and rank by the
+stable key, for example:
+
+```sql
+SELECT *
+FROM (
+  SELECT e.*,
+         row_number() OVER (
+           PARTITION BY project_id, kind, dedup_key
+           ORDER BY ts, id
+         ) AS replay_rank
+  FROM knievel.events_raw AS e
+  WHERE org_id = 'org_example'
+    AND project_id = 'pj_example'
+    AND kind IN (1, 2)
+    AND ts >= now() - interval '1 day'
+) AS ranked
+WHERE replay_rank = 1;
+```
+
+That policy is downstream-owned until the storage constraint changes. Decision
+rows have null `dedup_key` and are not replay-deduplicated.
+
+## Partitions and retention
+
+Migration `0010` creates a broad seed leaf for calendar year 2026. The runtime
+partition manager then attempts to create four daily leaves starting at the
+current UTC date. During 2026 those ranges overlap the attached year-wide leaf,
+so PostgreSQL rejects the first daily CREATE and `run_once` returns before the
+retention loop. There is no default partition; an event outside attached bounds
+fails loudly.
+
+When a maintenance pass reaches retention, leaves with names older than the
+configured cutoff are detached from `events_raw`. `DETACH PARTITION` removes
+them from parent queries but does not delete the table or its bytes. Operators
+must repair the overlapping seed layout, then inventory, archive, and drop
+detached tables themselves. `partitions.retention_days` defaults to 30 in Rust;
+the current Helm chart does not render that block.
+
+## `knievel.events_rollup`
+
+The leader-elected rollup processes settled hours under
+`SET LOCAL ROLE knievel_loader`. For rows where `is_duplicate=false`, it groups
+by:
+
+```text
+hour, project_id, kind, site_id, zone_id,
+flight_id, ad_id, creative_id
+```
+
+and writes `count bigint`. Every nullable dimension is converted to `0`, the
+“unattributed” sentinel, because all dimensions participate in the primary key.
+Real resource IDs start above zero.
+
+| Column | PostgreSQL type |
 |---|---|
-| `hour` | `timestamptz` (truncated to hour) |
-| `project_id` | `bigint` |
-| `site_id` | `bigint` |
-| `zone_id` | `bigint` |
-| `flight_id` | `bigint` |
-| `ad_id` | `bigint` |
-| `creative_id` | `bigint` |
+| `hour` | `timestamptz` |
+| `project_id` | `text` |
+| `site_id` | `bigint` (`0` when absent) |
+| `zone_id` | `bigint` (`0` when absent) |
+| `flight_id` | `bigint` (`0` when absent) |
+| `ad_id` | `bigint` (`0` when absent) |
+| `creative_id` | `bigint` (`0` when absent) |
 | `kind` | `smallint` |
 | `count` | `bigint` |
 
-Useful as a cheaper bronze input for dashboards that don't need raw
-event detail.
+`ON CONFLICT ... DO UPDATE SET count = EXCLUDED.count` makes recomputing one
+hour replace, rather than add to, its prior aggregate. The table has no
+automatic retention.
 
-### `knievel.events_rollup_watermark` (completeness signal)
+Because the rollup trusts `is_duplicate`, it inherits the timestamp caveat
+above. It is the aggregate of the server's current flag, not an independently
+re-deduplicated billing fact.
 
-A small system view that returns a single timestamp: the most
-recent hour for which `events_rollup` is **fully computed**. The
-rollup leader updates it after each successful aggregation pass.
+### Watermark
 
-```sql
-SELECT watermark FROM knievel.events_rollup_watermark;
--- watermark
--- ----------------------
--- 2026-05-05 14:00:00+00
-```
+`knievel.events_rollup_watermark` is a one-row table whose timestamp advances in
+the same loader-role transaction as a successful hour. On a fresh DB it starts
+at the Unix epoch; the rollup fast-forwards a very stale empty watermark to the
+earliest raw-event hour or the current target.
 
-Use this to combine the two tables without double-counting and
-without missing recent data:
+Use strictly older rollup hours and an at-or-after raw tail to avoid overlap:
 
 ```sql
--- Canonical impressions for the last 7 days, complete-and-fresh.
 WITH watermark AS (
-  SELECT watermark AS ts FROM knievel.events_rollup_watermark
-)
-SELECT date_trunc('hour', source.ts) AS hour, sum(c) AS impressions
-FROM (
-  -- Older data: pre-aggregated. count column is already non-duplicate.
-  SELECT hour AS ts, count AS c
+  SELECT watermark
+  FROM knievel.events_rollup_watermark
+  WHERE id = 1
+), hourly AS (
+  SELECT hour AS ts, count AS n
   FROM knievel.events_rollup, watermark
-  WHERE kind = 2  -- impression
-    AND hour < watermark.ts
+  WHERE project_id = 'pj_example'
+    AND kind = 1
+    AND hour < watermark.watermark
     AND hour >= now() - interval '7 days'
 
   UNION ALL
 
-  -- Recent data: from raw, deduped on the fly.
-  SELECT ts, 1 AS c
+  SELECT date_trunc('hour', ts) AS ts, count(*)::bigint AS n
   FROM knievel.events_raw, watermark
-  WHERE kind = 2
-    AND ts >= watermark.ts
+  WHERE org_id = 'org_example'
+    AND project_id = 'pj_example'
+    AND kind = 1
+    AND ts >= watermark.watermark
+    AND ts >= now() - interval '7 days'
     AND NOT is_duplicate
-) source
-GROUP BY 1
-ORDER BY 1;
-```
-
-The pattern:
-
-- Anything strictly older than `watermark` reads from `events_rollup`
-  (cheap, complete, and already deduplicated since rollup aggregates
-  non-duplicate rows only).
-- Anything at-or-after `watermark` reads from `events_raw WHERE NOT
-  is_duplicate` (slightly more expensive but accurate for the
-  tail).
-- The two ranges never overlap, so there's no double-count.
-
-Anti-patterns to call out:
-
-- **Querying both tables for the same range** without a watermark
-  cut. Don't.
-- **Treating `events_rollup` as eventually-consistent without
-  checking the watermark.** A dashboard that displays "last 24 h"
-  by always reading from `events_rollup` will under-report fresh
-  data because the rollup may be hours behind.
-- **Including `is_duplicate = true` rows when comparing to
-  `events_rollup`.** The rollup excludes them; comparing the two
-  will diverge.
-
-The watermark advances at a cadence equal to the rollup
-maintenance interval (default 1 h, leader-elected, see
-`REQUIREMENTS.md` §7.5). A stalled or wedged rollup leader is
-visible as the watermark falling behind `now() - 2h`; alert on
-`now() - watermark > 2 * rollup_interval`.
-
-### Dimensional tables
-
-These are mutable — names change, flights get extended, etc. dbt
-should snapshot them if SCD2 history matters; otherwise treat them
-as current-state lookups.
-
-| Table | Purpose |
-|---|---|
-| `knievel.organizations` | Top-level tenant. Rare changes. |
-| `knievel.projects` | Project-per-tenant directory. |
-| `knievel.advertisers` | Advertiser dimension. |
-| `knievel.campaigns` | Campaign dimension. Has `advertiser_id`. |
-| `knievel.flights` | Flight dimension. Has `campaign_id`, dates, priority, targeting (`site_ids`, `zone_ids`, `ad_types`). |
-| `knievel.ads` | Ad dimension. Has `flight_id`, `creative_id`, weight. |
-| `knievel.creatives` | Creative dimension. Type, dimensions, template id. |
-| `knievel.creative_templates` | Native-ad template definitions. |
-| `knievel.sites` | Site dimension. Has `url`, `aliases`, `channel_id`. |
-| `knievel.zones` | Zone dimension. Has `site_id`. |
-| `knievel.channels` | Channel grouping. |
-| `knievel.priorities` | Priority tiers. |
-| `knievel.ad_types` | Ad type catalog. |
-
-## dbt Integration
-
-A typical medallion layout against knievel:
-
-```
-sources (knievel.*)
-  └── bronze (raw, lightly cleaned)
-        └── silver (joined with dimensions, one model per business concept)
-              └── gold (aggregates, fact tables, reports)
-```
-
-### `_sources.yml`
-
-```yaml
-version: 2
-
-sources:
-  - name: knievel
-    schema: knievel
-    description: "Knievel ad-serving platform."
-    freshness:
-      warn_after: { count: 1, period: hour }
-      error_after: { count: 6, period: hour }
-    loaded_at_field: ts
-    tables:
-      - name: events_raw
-        description: "Append-only event facts (decisions, impressions, clicks)."
-        columns:
-          - name: ts
-            description: "Event time. Partition key."
-            tests:
-              - not_null
-          - name: kind
-            description: "1=decision, 2=impression, 3=click."
-      - name: events_rollup
-      - name: advertisers
-        loaded_at_field: updated_at
-      - name: campaigns
-      - name: flights
-      - name: ads
-      - name: creatives
-      - name: sites
-      - name: zones
-      - name: projects
-      - name: organizations
-```
-
-### Bronze: incremental copy with light cleanup
-
-```sql
--- models/bronze/knievel_events.sql
-{{ config(
-    materialized='incremental',
-    unique_key='signature_nonce',
-    incremental_strategy='append',
-    on_schema_change='sync_all_columns'
-) }}
-
-SELECT
-  ts,
-  org_id,
-  project_id,
-  CASE kind
-    WHEN 1 THEN 'decision'
-    WHEN 2 THEN 'impression'
-    WHEN 3 THEN 'click'
-  END AS kind,
-  placement_id,
-  site_id,
-  zone_id,
-  ad_id,
-  creative_id,
-  flight_id,
-  campaign_id,
-  advertiser_id,
-  url,
-  referrer_host,
-  signature_nonce
-FROM {{ source('knievel', 'events_raw') }}
-{% if is_incremental() %}
-  WHERE ts > (SELECT max(ts) - interval '1 hour' FROM {{ this }})
-{% endif %}
-```
-
-The `- interval '1 hour'` overlap absorbs flusher batches that may
-have arrived late; deduped by `signature_nonce`.
-
-### Silver: one model per event kind, joined with dims
-
-```sql
--- models/silver/ad_impressions.sql
-SELECT
-  e.ts                       AS impression_ts,
-  e.project_id,
-  e.placement_id,
-
-  -- Advertiser
-  e.advertiser_id,
-  a.name                     AS advertiser_name,
-  a.external_id              AS advertiser_external_id,
-
-  -- Campaign
-  e.campaign_id,
-  c.name                     AS campaign_name,
-
-  -- Flight
-  e.flight_id,
-  f.name                     AS flight_name,
-  f.start_date               AS flight_start,
-  f.end_date                 AS flight_end,
-  f.priority_id,
-
-  -- Creative
-  e.creative_id,
-  cr.name                    AS creative_name,
-  cr.type                    AS creative_type,
-
-  -- Ad
-  e.ad_id,
-  ad.weight                  AS ad_weight,
-
-  -- Inventory
-  e.site_id,
-  s.url                      AS site_url,
-  s.name                     AS site_name,
-  e.zone_id,
-  z.name                     AS zone_name,
-
-  -- Context
-  e.url                      AS page_url,
-  e.referrer_host
-
-FROM {{ ref('knievel_events') }}            e
-JOIN {{ source('knievel', 'advertisers') }} a  ON a.id  = e.advertiser_id
-JOIN {{ source('knievel', 'campaigns') }}   c  ON c.id  = e.campaign_id
-JOIN {{ source('knievel', 'flights') }}     f  ON f.id  = e.flight_id
-JOIN {{ source('knievel', 'ads') }}         ad ON ad.id = e.ad_id
-JOIN {{ source('knievel', 'creatives') }}   cr ON cr.id = e.creative_id
-JOIN {{ source('knievel', 'sites') }}       s  ON s.id  = e.site_id
-LEFT JOIN {{ source('knievel', 'zones') }}  z  ON z.id  = e.zone_id
-WHERE e.kind = 'impression'
-```
-
-`ad_clicks` and `ad_decisions` are siblings with `kind = 'click'` /
-`'decision'`. Click rows additionally need `redirect_target` if you
-add it (knievel can include it on click events).
-
-### Gold: aggregate fact tables
-
-```sql
--- models/gold/fact_daily_ad_performance.sql
-{{ config(materialized='table') }}
-
-WITH events AS (
-  SELECT 'impression' AS kind, ad_id, creative_id, flight_id,
-         campaign_id, advertiser_id, project_id, site_id,
-         impression_ts AS ts
-  FROM {{ ref('ad_impressions') }}
-  UNION ALL
-  SELECT 'click' AS kind, ad_id, creative_id, flight_id,
-         campaign_id, advertiser_id, project_id, site_id,
-         click_ts AS ts
-  FROM {{ ref('ad_clicks') }}
+  GROUP BY 1
 )
-SELECT
-  date_trunc('day', ts)::date AS day,
-  project_id,
-  advertiser_id,
-  campaign_id,
-  flight_id,
-  ad_id,
-  creative_id,
-  site_id,
-  count(*) FILTER (WHERE kind = 'impression') AS impressions,
-  count(*) FILTER (WHERE kind = 'click')      AS clicks,
-  count(*) FILTER (WHERE kind = 'click')::numeric
-    / NULLIF(count(*) FILTER (WHERE kind = 'impression'), 0) AS ctr
-FROM events
-GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+SELECT ts, sum(n) AS impressions
+FROM hourly
+GROUP BY ts
+ORDER BY ts;
 ```
 
-### Snapshots for SCD2 history
+This reflects the server's duplicate flag. Apply the downstream window/ranking
+rule from the prior section if replay-resistant counts are required.
 
-If your reports care about "what was the campaign called when this
-impression happened" (vs. its current name), snapshot the dimension
-tables:
+## RLS-capable reporting access
+
+A plain `GRANT SELECT` is insufficient because tables force RLS. Provision a
+non-login, non-bypass reader role after the app role exists:
 
 ```sql
--- snapshots/campaigns_snapshot.sql
-{% snapshot campaigns_snapshot %}
-{{ config(
-    target_schema='analytics_snapshots',
-    unique_key='id',
-    strategy='timestamp',
-    updated_at='updated_at'
-) }}
-SELECT * FROM {{ source('knievel', 'campaigns') }}
-{% endsnapshot %}
+CREATE ROLE knievel_reader NOLOGIN NOSUPERUSER NOBYPASSRLS;
+GRANT USAGE ON SCHEMA knievel TO knievel_reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA knievel TO knievel_reader;
+ALTER DEFAULT PRIVILEGES FOR ROLE knievel_app IN SCHEMA knievel
+  GRANT SELECT ON TABLES TO knievel_reader;
+
+GRANT knievel_reader TO analytics_service;
 ```
 
-Then silver models join against the snapshot at event time rather
-than the live dimension table.
+The trusted analytics login must use an explicit read-only transaction and bind
+the tenant GUCs before selecting:
 
-## Performance Notes
+```sql
+BEGIN TRANSACTION READ ONLY;
+SET LOCAL ROLE knievel_reader;
+SELECT set_config('knievel.org_id', 'org_example', true);
+SELECT set_config('knievel.project_id', 'pj_example', true);
 
-### Sizing expectations
+SELECT hour, kind, sum(count)
+FROM knievel.events_rollup
+WHERE project_id = 'pj_example'
+  AND hour >= now() - interval '7 days'
+GROUP BY hour, kind
+ORDER BY hour, kind;
 
-At 20k events/sec sustained, 30 days of `events_raw` is on the
-order of:
+COMMIT;
+```
 
-- ~52 B rows / day — partitioned, so daily queries scan one
-  partition
-- Each row is ~200 B uncompressed; ~10 GB / day raw, ~3–4 GB after
-  Postgres' page-level compression
-- 30 days = 100–300 GB on disk
+Use the same transaction shape for `events_raw` and the watermark. The GUCs are
+session inputs, not cryptographic authorization: a direct SQL analytics login
+that can set arbitrary values is a trusted operator identity with potential
+cross-tenant visibility. Do not expose it to untrusted end users. Keep the role
+`NOBYPASSRLS` so missing bindings fail closed.
 
-Most operators will be at 1–2 orders of magnitude lower volume.
-Reporting queries against a single day's partition are fast even
-without indexes.
+A read replica is suitable for reporting if its lag is acceptable. The running
+Knievel server itself must use the primary because it writes configuration,
+events, rollups, and partitions; current code does not use LISTEN despite older
+writer-endpoint explanations.
 
-### When to add indexes on raw
+## Capacity arithmetic
 
-Don't reflexively. Profile a slow report first. The shape that
-sometimes warrants an index:
+The following is arithmetic, not a measured throughput claim. At a sustained
+20,000 event rows per second:
 
-- Frequent dashboard query filters on `(project_id, advertiser_id,
-  ts)` and the partition pruning isn't enough — add an index on
-  `(project_id, advertiser_id)` per leaf partition.
+```text
+20,000 × 86,400 = 1,728,000,000 rows/day
+1,728,000,000 × 30 = 51,840,000,000 rows/30 days
+51,840,000,000 × 200 bytes = 10,368,000,000,000 bytes
+```
 
-Adding via `pg_partman`-style template? We don't use pg_partman, so
-new partitions need the index applied at creation time. The Rust
-partition manager creates partitions; if you need indexes, configure
-them in `partitions.partition_indexes` (operator-supplied SQL run
-after `CREATE TABLE ... PARTITION OF ...`).
+That is **1.728 billion rows/day**, **51.84 billion rows over 30 days**, and
+approximately **10.37 TB at 200 bytes/row before PostgreSQL page, tuple, index,
+WAL, backup, and replica overhead**. The actual schema has wide nullable columns
+and two parent constraints, so 200 bytes is only a simplifying assumption, not
+a sizing guarantee.
 
-### Materializing for BI
+The current per-row INSERT implementation has not demonstrated that sustained
+rate. Benchmark the exact hardware, connection pool, WAL/storage, partition
+shape, and query load before selecting retention. Detached leaves still count
+against physical storage.
 
-For real-time dashboards, point BI tools at `events_rollup` rather
-than `events_raw`. For historical analysis (>30 days), rely on dbt
-gold tables that have moved beyond knievel's retention window.
+## Recommended downstream model
 
-## What Knievel Ships to Help
+1. Read a bounded raw window from the partitioned parent under a tenant-bound
+   transaction.
+2. Preserve `(id, ts)` as the physical row identity.
+3. Map `0/1/2` to names in downstream SQL, not at ingestion.
+4. For pings, derive the desired replay policy from
+   `(project_id, kind, dedup_key)` and event time.
+5. Snapshot mutable dimensions if historical names/targeting matter.
+6. Use `events_rollup` only when its dimensions and current duplicate semantics
+   are sufficient.
+7. Monitor watermark lag and detached-table bytes independently.
 
-- `knievel_reader` role grants documented in `MIGRATION_RX.md` and
-  the operator's quickstart.
-- An `examples/dbt/` skeleton in the knievel repo with the source
-  YAML and one-each bronze/silver/gold model. Operators copy/paste
-  into their dbt project to get started.
-- Foreign key constraints between events tables and dimension
-  tables are **not** enforced (would slow ingest); dbt models
-  joining without FKs is fine.
+## Current non-features
 
-## What's Out of Scope (v0)
+- No reporting HTTP endpoints or reporting UI.
+- No CDC/Kafka sink.
+- No shipped dbt project or `examples/dbt/` directory.
+- No raw-partition index configuration field.
+- No automated archive/drop of detached leaves.
+- No proven COPY ingest path.
 
-- A built-in reporting API on knievel itself. Operators with dbt
-  pipelines don't need it; deployments without dbt can compute from
-  `events_rollup` directly. Native reporting endpoints are on the
-  roadmap (`REQUIREMENTS.md` §11).
-- Real-time streaming (CDC) of `events_raw` to Kafka or similar.
-  Postgres + dbt incremental models is sufficient for batch and
-  near-real-time. Streaming is a roadmap item if a use case emerges.
-- ML feature stores. Out of scope for the platform; build them
-  downstream in your warehouse.
-
-## References
-
-- [dbt Sources](https://docs.getdbt.com/docs/build/sources)
-- [dbt Incremental Models](https://docs.getdbt.com/docs/build/incremental-models)
-- [dbt Snapshots](https://docs.getdbt.com/docs/build/snapshots)
-- [Medallion Architecture (Databricks)](https://www.databricks.com/glossary/medallion-architecture)
+Build these downstream only after accounting for RLS, watermark, and dedup
+semantics above.

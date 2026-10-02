@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>knievel API reference</title>
-  <meta name="description" content="Live OpenAPI 3.0 reference for knievel. Rendered from the spec on the main branch.">
+  <meta name="description" content="OpenAPI 3.0 reference for Knievel, rendered from the generated spec on the main branch.">
   <style>
     body { margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     .topbar { padding: .8rem 1.2rem; border-bottom: 1px solid #e5e7eb; display: flex; gap: 1rem; align-items: center; }
@@ -18,7 +18,7 @@
 <nav class="topbar">
   <a href="index.html">← knievel</a>
   <span class="sep">·</span>
-  <span>API reference (live from main)</span>
+  <span>Generated API reference (current main, possibly unreleased)</span>
   <span class="sep">·</span>
   <a href="https://github.com/knievel-ads/knievel/blob/main/openapi.yaml">openapi.yaml</a>
   <span class="sep">·</span>
@@ -26,10 +26,10 @@
 </nav>
 
 <!--
-  Redoc renders openapi.yaml fetched at runtime from the canonical
-  source on `main`. This always reflects the latest spec —
-  consumers who need a pinned version should reference the
-  `openapi.yaml` at a specific tag (e.g. .../knievel/blob/v0.1.6/openapi.yaml).
+  Redoc renders the generated openapi.yaml from main. This can be newer than
+  the latest release. Consumers that need a stable contract should fetch
+  openapi.yaml from the exact release tag or commit they deploy; no release
+  number is hard-coded into this page.
 -->
 <redoc spec-url="https://raw.githubusercontent.com/knievel-ads/knievel/main/openapi.yaml"></redoc>
 <script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"></script>
